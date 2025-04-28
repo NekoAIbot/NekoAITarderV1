@@ -1,0 +1,7 @@
+pandas
+numpy
+scikit-learn
+python-telegram-bot
+schedule
+python-dotenv
+requests
