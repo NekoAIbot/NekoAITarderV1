@@ -7,33 +7,31 @@ import time
 import os
 from datetime import datetime
 
-from config import get_today_symbols
+from config import get_today_symbols, SL_AMOUNT, TP_AMOUNT
 from app.mt5_handler import initialize_mt5, shutdown_mt5
 from app.models.basic_model import BasicModel
-from app.telegram_bot import send_message
+from app.telegram_bot import send_message, send_message_channel
 from app.state import increment_trade_count
+from app.risk_manager import RiskManager
 
-# Read mock trade configs
-MOCK_TRADE_VOLUME = float(os.getenv("MOCK_TRADE_VOLUME", 0.01))
 MOCK_TRADE_HOLD_SECONDS = int(os.getenv("MOCK_TRADE_HOLD_SECONDS", 120))
+PRE_SIGNAL_WAIT        = 30  # seconds
 
 def fetch_market_data(mt5, symbol):
     """Fetch real or dummy data for a single symbol."""
     if mt5:
         rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 100)
         return pd.DataFrame(rates)
-    # dummy fallback
-    df = pd.DataFrame({
+    return pd.DataFrame({
         "open":   np.random.rand(100),
         "high":   np.random.rand(100),
         "low":    np.random.rand(100),
         "close":  np.random.rand(100),
         "volume": np.random.randint(1, 1000, size=100),
     })
-    return df
 
-def open_mock_trade(mt5, symbol, signal):
-    """Open a small test trade."""
+def open_mock_trade(mt5, symbol, signal, volume):
+    """Open a small test trade at dynamic volume."""
     if signal.lower() == "buy":
         order_type = mt5.ORDER_TYPE_BUY
         price = mt5.symbol_info_tick(symbol).ask
@@ -41,10 +39,10 @@ def open_mock_trade(mt5, symbol, signal):
         order_type = mt5.ORDER_TYPE_SELL
         price = mt5.symbol_info_tick(symbol).bid
 
-    request = {
+    req = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
-        "volume": MOCK_TRADE_VOLUME,
+        "volume": volume,
         "type": order_type,
         "price": price,
         "deviation": 10,
@@ -53,45 +51,37 @@ def open_mock_trade(mt5, symbol, signal):
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
-
-    result = mt5.order_send(request)
-    if result.retcode == mt5.TRADE_RETCODE_DONE:
-        print(f"✅ Mock trade opened: {symbol} Ticket {result.order}")
-    else:
-        print(f"❌ Trade open failed for {symbol} - Code {result.retcode}")
-    return result
+    res = mt5.order_send(req)
+    return res, price
 
 def close_mock_trade(mt5, ticket, symbol):
-    """Close the opened mock trade."""
-    position = mt5.positions_get(ticket=ticket)
-    if not position:
-        print(f"⚠️ No open position found for ticket {ticket}")
-        return None
+    """Close the opened mock trade and return exit price."""
+    pos = mt5.positions_get(ticket=ticket)
+    if not pos:
+        return None, None
+    pos = pos[0]
+    if pos.type == mt5.ORDER_TYPE_BUY:
+        exit_price = mt5.symbol_info_tick(symbol).bid
+        close_type = mt5.ORDER_TYPE_SELL
+    else:
+        exit_price = mt5.symbol_info_tick(symbol).ask
+        close_type = mt5.ORDER_TYPE_BUY
 
-    position = position[0]
-    price = mt5.symbol_info_tick(symbol).bid if position.type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(symbol).ask
-
-    request = {
+    req = {
         "action": mt5.TRADE_ACTION_DEAL,
         "position": ticket,
         "symbol": symbol,
-        "volume": position.volume,
-        "type": mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY,
-        "price": price,
+        "volume": pos.volume,
+        "type": close_type,
+        "price": exit_price,
         "deviation": 10,
         "magic": 123456,
         "comment": "Close Test Trade",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
-
-    result = mt5.order_send(request)
-    if result.retcode == mt5.TRADE_RETCODE_DONE:
-        print(f"✅ Trade closed: {symbol} Ticket {ticket}")
-        return result
-    else:
-        print(f"❌ Trade close failed for {symbol} Ticket {ticket}")
-        return None
+    res = mt5.order_send(req)
+    return res, exit_price
 
 def check_trade_profit(mt5, ticket):
     """Get final profit after closing trade."""
@@ -102,42 +92,88 @@ def check_trade_profit(mt5, ticket):
     return None
 
 def trading_job():
-    """Main trading execution job."""
+    """Main trading execution job, one pre‐signal + main signal per asset."""
     symbols = get_today_symbols()
     print(f"[{datetime.utcnow()}] Running trading job for: {symbols}")
 
-    mt5 = initialize_mt5()
+    mt5   = initialize_mt5()
     model = BasicModel()
+    rm    = RiskManager()
 
     for sym in symbols:
-        df = fetch_market_data(mt5, sym)
-        signal = model.predict(df)
-        msg = f"{sym}: SIGNAL → {signal.upper()}"
-        send_message(msg)
+        # 1) Send pre‐signal alert to personal & channel
+        pre = (
+            "⚠️ Risk Alert:\n"
+            "Market conditions indicate heightened risk.\n"
+            "Ensure proper risk management before proceeding.\n"
+            "⏳ Preparing to drop a trade signal..."
+        )
+        send_message(pre)
+        send_message_channel(pre)
 
+        # 2) Wait before the main boxed signal
+        time.sleep(PRE_SIGNAL_WAIT)
+
+        # 3) Fetch data & get AI signal
+        df     = fetch_market_data(mt5, sym)
+        ai_raw = model.predict(df).get("signal", "HOLD").upper()
+
+        # 4) Prepare boxed main signal
+        ts        = int(datetime.utcnow().timestamp())
+        signal_id = f"NekoAITrader_{ts}"
+        entry     = (
+            mt5.symbol_info_tick(sym).ask if ai_raw == "BUY"
+            else mt5.symbol_info_tick(sym).bid
+        ) if mt5 else df["close"].iloc[-1]
+        sl        = entry - SL_AMOUNT
+        tp1, tp2, tp3 = entry + TP_AMOUNT, entry + 2*TP_AMOUNT, entry + 3*TP_AMOUNT
+
+        main = (
+            "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+            "┃ 🚀 NekoAIBot Trade Signal 🚀 ┃\n"
+            "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n\n"
+            f"Signal ID: {signal_id}\n"
+            f"Pair/Asset:   {sym}\n"
+            "Predicted Change: N/A\n"
+            "News Sentiment:    N/A\n"
+            f"AI Signal:     {ai_raw}\n"
+            "Confidence:     0.0%\n\n"
+            f"Entry:      {entry:.5f}\n"
+            f"Stop Loss:  {sl:.5f}\n"
+            "——————————————\n"
+            "Take Profits:\n"
+            f"  • TP1: {tp1:.5f}\n"
+            f"  • TP2: {tp2:.5f}\n"
+            f"  • TP3: {tp3:.5f}\n\n"
+            "⚠️ Risk Warning: Trading involves significant risk.\n\n"
+            "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+            "┃   NekoAIBot - Next-Gen Trading   ┃\n"
+            "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+        )
+        boxed = f"<pre>{main}</pre>"
+        send_message(boxed)
+        send_message_channel(boxed)
+
+        # 5) Execute the trade
+        volume = rm.get_lot()
         if mt5:
-            result = open_mock_trade(mt5, sym, signal)
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
+            res_open, _ = open_mock_trade(mt5, sym, ai_raw, volume)
+            if res_open.retcode != mt5.TRADE_RETCODE_DONE:
                 continue
 
-            ticket = result.order
-
-            print(f"⏳ Waiting {MOCK_TRADE_HOLD_SECONDS} seconds before closing...")
+            ticket = res_open.order
+            print(f"⏳ Waiting {MOCK_TRADE_HOLD_SECONDS}s before closing…")
             time.sleep(MOCK_TRADE_HOLD_SECONDS)
 
-            close_mock_trade(mt5, ticket, sym)
-            final_profit = check_trade_profit(mt5, ticket)
-
-            if final_profit is not None:
-                win = final_profit > 0
-                increment_trade_count(symbol=sym, win=win)
-                print(f"🏁 {sym} trade result: {'WIN' if win else 'LOSS'} ({final_profit:.2f} profit)")
-            else:
-                print(f"⚠️ Could not determine trade outcome for {sym}, assuming loss.")
-                increment_trade_count(symbol=sym, win=False)
+            _, exit_price = close_mock_trade(mt5, ticket, sym)
+            profit = check_trade_profit(mt5, ticket)
+            win    = (profit or 0) > 0
+            increment_trade_count(sym, win=win)
+            rm.adjust(win)
+            print(f"🏁 {sym} trade {'WIN' if win else 'LOSS'} ({profit:.2f})")
         else:
-            # fallback random win/loss
-            simulated_result = random.choice([True, False])
-            increment_trade_count(symbol=sym, win=simulated_result)
+            win = random.choice([True, False])
+            increment_trade_count(sym, win=win)
+            rm.adjust(win)
 
     shutdown_mt5(mt5)
