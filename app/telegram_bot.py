@@ -9,9 +9,9 @@ API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 def _post(text: str, chat_id: str):
     payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML"
+        "chat_id":   chat_id,
+        "text":      text,
+        "parse_mode":"HTML"
     }
     resp = requests.post(API_URL, data=payload, timeout=10)
     try:

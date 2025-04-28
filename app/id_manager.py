@@ -16,13 +16,13 @@ class IDManager:
             try:
                 payload = json.loads(self.file.read_text())
                 self.current_id = payload.get("current_id", 0)
-            except Exception:
+            except:
                 self.current_id = 0
 
     def next(self) -> int:
         self.current_id += 1
         try:
             self.file.write_text(json.dumps({"current_id": self.current_id}))
-        except Exception:
+        except:
             pass
         return self.current_id
