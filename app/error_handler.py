@@ -1,10 +1,9 @@
 # app/error_handler.py
-
 import traceback
-from app.telegram_bot import send_message
+from app.telegram_bot import send_message, send_message_channel
 
 def report_exception(e):
-    """Format and send error to Telegram."""
-    error_text = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
-    message = f"🚨 Bot Error Detected 🚨\n\n{error_text[:4000]}"  # Telegram max = 4096 chars
-    send_message(message)
+    err = ''.join(traceback.format_exception(type(e), e, e.__traceback__))
+    msg = f"🚨 Bot Error 🚨\n\n<pre>{err[:4000]}</pre>"
+    send_message(msg)
+    send_message_channel(msg)

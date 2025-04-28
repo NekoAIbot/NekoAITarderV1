@@ -3,7 +3,7 @@ import os
 from dotenv import load_dotenv
 from datetime import datetime
 
-load_dotenv()  # load from .env
+load_dotenv()
 
 # Telegram
 TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -28,30 +28,23 @@ OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")
 EXHAUSTIVE_SEARCH = os.getenv("EXHAUSTIVE_SEARCH", "false").lower() == "true"
 TESTING_MODE      = os.getenv("TESTING_MODE",      "false").lower() == "true"
 
-# Trading interval (minutes) when NOT in testing
+# Trading interval
 TRADING_INTERVAL_MINUTES = int(os.getenv("TRADING_INTERVAL_MINUTES", 5))
 
-# ── Position-sizing settings ───────────────────────────────────────────────
+# Position-sizing
 LOT_MIN            = float(os.getenv("LOT_MIN",            0.01))
 LOT_MAX            = float(os.getenv("LOT_MAX",            0.20))
 LOT_BASE           = float(os.getenv("LOT_BASE",           LOT_MIN))
 LOT_ADJUST_PERCENT = float(os.getenv("LOT_ADJUST_PERCENT", 10.0))
-# Stop-loss / Take-profit defaults (quote-currency units)
-SL_AMOUNT          = float(os.getenv("SL_AMOUNT",          2.0))
-TP_AMOUNT          = float(os.getenv("TP_AMOUNT",          3.0))
-# ────────────────────────────────────────────────────────────────────────────
 
-# Asset lists
-FOREX_MAJORS = [
-    "EURUSD", "GBPUSD", "USDJPY", "AUDUSD",
-    "USDCAD", "USDCHF", "NZDUSD"
-]
-CRYPTO_ASSETS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT",
-    "ADAUSDT", "DOTUSDT", "MATICUSDT"
-]
+# SL/TP defaults
+SL_AMOUNT = float(os.getenv("SL_AMOUNT", 2.0))
+TP_AMOUNT = float(os.getenv("TP_AMOUNT", 3.0))
+
+# Assets
+FOREX_MAJORS = ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD"]
+CRYPTO_ASSETS= ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","ADAUSDT","DOTUSDT","MATICUSDT"]
 
 def get_today_symbols():
-    """Weekdays → Forex majors; Weekends → Crypto assets."""
-    weekday = datetime.utcnow().weekday()  # 0=Mon…6=Sun
+    weekday = datetime.utcnow().weekday()
     return FOREX_MAJORS if weekday < 5 else CRYPTO_ASSETS

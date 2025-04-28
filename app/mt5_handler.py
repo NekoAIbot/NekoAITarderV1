@@ -29,7 +29,6 @@ def open_trade(mt5, symbol, signal, volume, sl, tp):
     order_type = mt5mod.ORDER_TYPE_BUY if signal.lower()=="buy" else mt5mod.ORDER_TYPE_SELL
     tick = mt5mod.symbol_info_tick(symbol)
     price = tick.ask if order_type==mt5mod.ORDER_TYPE_BUY else tick.bid
-
     request = {
         "action":     mt5mod.TRADE_ACTION_DEAL,
         "symbol":     symbol,
@@ -42,11 +41,11 @@ def open_trade(mt5, symbol, signal, volume, sl, tp):
         "magic":      123456,
         "comment":    "Live Trade",
         "type_time":  mt5mod.ORDER_TIME_GTC,
-        "type_filling": mt5mod.ORDER_FILLING_IOC,
+        "type_filling":mt5mod.ORDER_FILLING_IOC,
     }
-    result = mt5mod.order_send(request)
-    if result.retcode == mt5mod.TRADE_RETCODE_DONE:
-        print(f"✅ Opened trade {symbol} Ticket {result.order}")
+    res = mt5mod.order_send(request)
+    if res.retcode == mt5mod.TRADE_RETCODE_DONE:
+        print(f"✅ Opened trade {symbol} Ticket {res.order}")
     else:
-        print(f"❌ Open failed {symbol} Code {result.retcode}")
-    return result
+        print(f"❌ Open failed {symbol} Code {res.retcode}")
+    return res
