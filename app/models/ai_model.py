@@ -6,22 +6,26 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 import joblib
 
-MODEL_DIR = Path(__file__).parent / "models"
+MODEL_DIR  = Path(__file__).parent / "models"
 MODEL_FILE = MODEL_DIR / "rf_model.joblib"
 
-class AIModel:
+class MomentumModel:
     """
-    Trains a RandomForest to predict next-bar direction.
+    Momentum-based model using RandomForest to predict next-bar direction.
     """
-    def __init__(self):
+
+    def __init__(self, lookback: int = 20):
+        self.lookback = lookback  # Required for backtesting loop window
+        # ensure model directory exists
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
         if MODEL_FILE.exists():
-            # load existing model
+            # load existing pipeline
             self.pipeline = joblib.load(MODEL_FILE)
         else:
             # fresh pipeline: scaler + RF
             self.pipeline = Pipeline([
-                ("scaler",   StandardScaler()),
-                ("clf",      RandomForestClassifier(
+                ("scaler", StandardScaler()),
+                ("clf",    RandomForestClassifier(
                     n_estimators=200,
                     max_depth=5,
                     random_state=42,
@@ -30,8 +34,11 @@ class AIModel:
             ])
 
     @staticmethod
-    def featurize(df: pd.DataFrame, news: float) -> pd.DataFrame:
-        """Compute technical indicators + news sentiment column."""
+    def featurize(df: pd.DataFrame, news):
+        """
+        Compute technical indicators + news sentiment column.
+        `news` can be a scalar (float) or a pd.Series indexed like `df`.
+        """
         X = df.copy()
         # 1) returns
         X["ret1"]  = X["close"].pct_change(1)
@@ -54,8 +61,13 @@ class AIModel:
             (X["low"]  - X["close"].shift()).abs(),
         ])
         X["atr"] = X["tr"].rolling(14).mean()
-        # 5) news sentiment (constant per sample)
-        X["sentiment"] = news
+        # 5) news sentiment
+        if isinstance(news, pd.Series):
+            # align series
+            X["sentiment"] = news.reindex(X.index).fillna(0.0)
+        else:
+            # scalar
+            X["sentiment"] = float(news)
         # drop NaNs
         X = X.dropna()
         # select features
@@ -71,33 +83,35 @@ class AIModel:
         df2 = df.copy()
         df2["target"] = np.sign(df2["close"].shift(-1) - df2["close"])
         df2 = df2.dropna()
+
         # featurize
-        # we’ll assume `news_series` has same index
-        X = self.featurize(df2, news_series.loc[df2.index])
-        y = df2.loc[X.index, "target"].apply(lambda x: 1 if x>0 else 0)
+        X = self.featurize(df2, news_series)
+        y = df2.loc[X.index, "target"].apply(lambda x: 1 if x > 0 else 0)
+
         # fit pipeline
         self.pipeline.fit(X, y)
+
         # persist
-        MODEL_DIR.mkdir(exist_ok=True)
         joblib.dump(self.pipeline, MODEL_FILE)
 
     def predict(self, df: pd.DataFrame, news: float) -> dict:
         """
-        Given the last 100 rows + a single news sentiment value,
-        return signal, prob, and predicted_change.
+        Given the last N rows + a single news sentiment value,
+        return signal, confidence, and predicted_change.
         """
-        # featurize last sample
         feat = self.featurize(df, news).iloc[[-1]]
         probs = self.pipeline.predict_proba(feat)[0]
-        # class 1 = up, class 0 = down
-        up_prob = float(probs[1])
+        up_prob   = float(probs[1])
         down_prob = float(probs[0])
-        sig = "BUY" if up_prob > down_prob else "SELL"
-        # predicted_change: use model probability differential
-        pred_change = (up_prob - down_prob) * 100
-        conf = max(up_prob, down_prob) * 100
+
+        sig          = "BUY" if up_prob > down_prob else "SELL"
+        pred_change  = (up_prob - down_prob) * 100
+        conf         = max(up_prob, down_prob) * 100
+
         return {
             "signal":           sig,
             "confidence":       conf,
             "predicted_change": pred_change,
         }
+
+__all__ = ["MomentumModel"]

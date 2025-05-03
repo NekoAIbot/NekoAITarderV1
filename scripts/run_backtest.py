@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# File: scripts/run_backtest.py
-
 import sys
 from pathlib import Path
 
@@ -9,12 +7,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from config import get_today_symbols
-from app.models.ai_model import MomentumModel
+from config import FOREX_MAJORS, CRYPTO_ASSETS
+from app.models.ai_model import MomentumModel as AIModel
 from app.backtester import backtest_symbol
 
 def compute_stats(pl_list):
-    """Given a list of per-trade P/L, return stats dict."""
     n       = len(pl_list)
     total   = sum(pl_list)
     avg     = total / n if n else 0.0
@@ -28,11 +25,12 @@ def compute_stats(pl_list):
     }
 
 def main(symbols):
-    model      = MomentumModel(lookback=5)
+    model      = AIModel()
     overall_pl = []
 
     for sym in symbols:
         print(f"\n🔍 Backtesting {sym} …")
+        # backtest_symbol returns a list of individual trade P/Ls
         pl_list = backtest_symbol(sym, model, fee_per_trade=0.0)
         stats   = compute_stats(pl_list)
         overall_pl.extend(pl_list)
@@ -52,10 +50,10 @@ def main(symbols):
     )
 
 if __name__ == "__main__":
-    # If the user passed symbols on the command line, use those.
-    # Otherwise, grab the full list from config.get_today_symbols()
+    # If user passed symbols on the command line, use those.
+    # Otherwise backtest the full universe.
     if len(sys.argv) > 1:
         syms = sys.argv[1:]
     else:
-        syms = get_today_symbols()
+        syms = FOREX_MAJORS + CRYPTO_ASSETS
     main(syms)

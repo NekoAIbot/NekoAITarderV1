@@ -8,7 +8,7 @@ from datetime import datetime
 from config import get_today_symbols, SL_AMOUNT, TP_AMOUNT, USE_MOCK_MT5
 from app.market_data import fetch_market_data
 from app.mt5_handler import initialize_mt5, shutdown_mt5, open_trade, close_trade
-from app.models.momentum_model import MomentumModel as BasicModel
+from app.models.ai_model import MomentumModel as BasicModel
 from app.news import get_news_sentiment
 from app.telegram_bot import send_message, send_message_channel
 from app.state import increment_trade_count
@@ -17,7 +17,6 @@ from app.id_manager import IDManager
 
 MOCK_TRADE_HOLD_SECONDS = int(os.getenv("MOCK_TRADE_HOLD_SECONDS", 120))
 PRE_SIGNAL_WAIT        = 30  # seconds
-
 
 def trading_job():
     """Main trading execution: pre-signal, AI signal, execute trades."""
@@ -41,40 +40,40 @@ def trading_job():
         send_message_channel(pre)
         time.sleep(PRE_SIGNAL_WAIT)
 
-        # 2) Fetch data & AI predict
+        # 2) Fetch data & live news sentiment
         df  = fetch_market_data(sym)
-        out = model.predict(df)
+        ns  = get_news_sentiment(sym)
+
+        # 3) AI predict (pass in news)
+        out  = model.predict(df, ns)
         sig  = out.get("signal", "HOLD").upper()
         conf = out.get("confidence", 0.0)
         pc   = out.get("predicted_change", 0.0)
 
-        # 2b) News sentiment (live)
-        ns = get_news_sentiment(sym)
-
         sid = idm.next()
 
-        # 3) Determine entry price
+        # 4) Determine entry price
         entry = None
         if mt5 and not USE_MOCK_MT5:
             import MetaTrader5 as mt5mod
-            # ensure symbol is loaded
             mt5mod.symbol_select(sym, True)
             tick = mt5mod.symbol_info_tick(sym)
-            if tick and (sig == "BUY" and tick.ask is not None or sig == "SELL" and tick.bid is not None):
+            if tick and ((sig == "BUY" and tick.ask is not None)
+                         or (sig == "SELL" and tick.bid is not None)):
                 entry = tick.ask if sig == "BUY" else tick.bid
             else:
                 print(f"❌ No tick data for {sym}, falling back to last close.")
         if entry is None:
             entry = df["close"].iloc[-1]
 
-        # 4) Display-only SL/TP
+        # 5) Display-only SL/TP
         pip = 0.01 if sym.endswith("JPY") else 0.0001
         sl_price  = entry - SL_AMOUNT * pip if sig == "BUY" else entry + SL_AMOUNT * pip
         tp1_price = entry + TP_AMOUNT * pip if sig == "BUY" else entry - TP_AMOUNT * pip
         tp2_price = entry + 2 * TP_AMOUNT * pip if sig == "BUY" else entry - 2 * TP_AMOUNT * pip
         tp3_price = entry + 3 * TP_AMOUNT * pip if sig == "BUY" else entry - 3 * TP_AMOUNT * pip
 
-        # 5) Send boxed main signal
+        # 6) Send boxed main signal
         box = (
             "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
             "┃ 🚀 NekoAIBot Trade Signal 🚀 ┃\n"
@@ -100,18 +99,18 @@ def trading_job():
         send_message(f"<pre>{box}</pre>")
         send_message_channel(f"<pre>{box}</pre>")
 
-        # 6) Execute trade
+        # 7) Execute trade
         volume = rm.get_lot()
         res    = open_trade(mt5, sym, sig, volume)
         if not res or (hasattr(res, "retcode") and res.retcode != 0):
             continue
         ticket = getattr(res, "order", None)
 
-        # 7) Hold then close
+        # 8) Hold then close
         time.sleep(MOCK_TRADE_HOLD_SECONDS)
         close_trade(mt5, ticket, sym)
 
-        # 8) Profit & stats
+        # 9) Profit & stats
         profit = 0.0
         if mt5 and hasattr(mt5, "history_deals_get"):
             try:
