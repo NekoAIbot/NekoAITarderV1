@@ -25,9 +25,19 @@ def _write_cache(symbol: str, df: pd.DataFrame):
     path = CACHE_DIR / f"{symbol}_1m.json"
     df.to_json(path, orient="records")
 
+def _normalize_symbol_for_api(symbol: str) -> str:
+    """
+    TwelveData expects, e.g. BTC/USD not BTC/USDT.
+    AlphaVantage expects from_symbol, to_symbol.
+    We'll map any *USDT* to USD here.
+    """
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol[:3]
+    quote = "USD" if symbol.endswith("USDT") else symbol[3:]
+    return f"{base}/{quote}"
+
 def fetch_twelvedata(symbol: str) -> pd.DataFrame:
     """Fetch 1-min bars from TwelveData, drop datetime, pause 10–15s."""
-    pair = f"{symbol[:3]}/{symbol[3:]}"
+    pair = _normalize_symbol_for_api(symbol)
     resp = requests.get(
         "https://api.twelvedata.com/time_series",
         params={
@@ -44,28 +54,27 @@ def fetch_twelvedata(symbol: str) -> pd.DataFrame:
 
     df = pd.DataFrame(resp["values"])[::-1].reset_index(drop=True)
 
-    # Force-drop any timestamp
+    # drop datetime, ensure OHLCV
     if "datetime" in df.columns:
         df = df.drop(columns=["datetime"])
-
-    # Ensure exactly OHLCV
     for col in ("open", "high", "low", "close", "volume"):
         if col not in df.columns:
             df[col] = 0.0
-
-    df = df[["open", "high", "low", "close", "volume"]].astype("float")
+    df = df[["open", "high", "low", "close", "volume"]].astype(float)
 
     time.sleep(random.uniform(10, 15))
     return df
 
 def fetch_alphavantage(symbol: str) -> pd.DataFrame:
     """Fetch 1-min FX bars from AlphaVantage, pause 10–15s."""
+    # same normalization
+    base, quote = (_normalize_symbol_for_api(symbol).split("/"))
     resp = requests.get(
         "https://www.alphavantage.co/query",
         params={
             "function":    "FX_INTRADAY",
-            "from_symbol": symbol[:3],
-            "to_symbol":   symbol[3:],
+            "from_symbol": base,
+            "to_symbol":   quote,
             "interval":    "1min",
             "outputsize":  "compact",
             "apikey":      ALPHAVANTAGE_API_KEY,
@@ -78,7 +87,7 @@ def fetch_alphavantage(symbol: str) -> pd.DataFrame:
         raise ValueError(f"AlphaVantage error: {resp}")
 
     records = []
-    for _, vals in resp[key].items():
+    for vals in resp[key].values():
         records.append({
             "open":   float(vals["1. open"]),
             "high":   float(vals["2. high"]),
@@ -88,13 +97,10 @@ def fetch_alphavantage(symbol: str) -> pd.DataFrame:
         })
 
     df = pd.DataFrame(records)
-
-    # Ensure exactly OHLCV
     for col in ("open", "high", "low", "close", "volume"):
         if col not in df.columns:
             df[col] = 0.0
-
-    df = df[["open", "high", "low", "close", "volume"]].astype("float")
+    df = df[["open", "high", "low", "close", "volume"]].astype(float)
 
     time.sleep(random.uniform(10, 15))
     return df
@@ -103,9 +109,9 @@ def fetch_market_data(symbol: str) -> pd.DataFrame:
     """
     Return latest 100 1-min bars for `symbol`, with:
       1) Cache (5 min)
-      2) fetch_twelvedata() → pause
-      3) fallback fetch_alphavantage() → pause
-      4) dummy fallback
+      2) TwelveData → pause
+      3) AlphaVantage → pause
+      4) Dummy
     """
     # 1) Cache
     df = _read_cache(symbol)

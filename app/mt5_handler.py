@@ -3,10 +3,12 @@
 
 import os
 import time
+import math
 from config import USE_MOCK_MT5, MT5_LOGIN, MT5_PASSWORD, MT5_SERVER
+from app.market_data import fetch_market_data
 
 def initialize_mt5():
-    """Initialize and log in to MT5, or return None if using mock."""
+    """Initialize and log in to MT5 (or return None if using mock)."""
     if USE_MOCK_MT5:
         print("⚠️ MOCK MT5 enabled—skipping real MT5 init.")
         return None
@@ -29,181 +31,181 @@ def initialize_mt5():
     print("✅ MT5 initialized & logged in.")
     return mt5
 
+
+def get_symbol_properties(mt5mod, symbol: str):
+    """Auto-detect the broker’s exact symbol name and return (name, info)."""
+    variations = [
+        symbol.replace('USDT', 'USD').upper(),
+        symbol.replace('/', '').upper(),
+        symbol.upper()
+    ]
+    for sym in variations:
+        if mt5mod.symbol_select(sym, True):
+            info = mt5mod.symbol_info(sym)
+            if info:
+                return sym, info
+    return None, None
+
+
 def compute_trade_levels(entry_price: float,
-                         opposite_price: float,
                          side: str,
-                         symbol: str,
-                         mt5=None) -> dict:
+                         info,
+                         symbol: str) -> dict:
     """
-    Compute SL/TP levels with a default 50% buffer,
-    but a 100% buffer for USDCAD & NZDUSD to overcome their stricter freeze.
+    Calculate SL/TP:
+    - For FX (EURUSD, USDJPY, USDCAD, NZDUSD) we respect the broker's trade_stops_level.
+    - For everything else we clamp that to our own pip‐based minimum.
     """
-    # Static fallback params
-    fallback = {
-        'EURUSD': {'digits':5, 'point':1e-5, 'trade_stops_level':20},
-        'USDJPY': {'digits':3, 'point':1e-3, 'trade_stops_level':20},
-        'USDCAD': {'digits':5, 'point':1e-5, 'trade_stops_level':20},
-        'NZDUSD': {'digits':5, 'point':1e-5, 'trade_stops_level':20},
-    }
-    p = fallback.get(symbol, {})
-    digits   = p.get('digits', 5)
-    point    = p.get('point',   1e-5)
-    min_pts  = p.get('trade_stops_level', 20)
-    min_dist = min_pts * point
+    digits = info.digits
+    point  = info.point
+    raw_min_dist = info.trade_stops_level * point
 
-    # Override from live MT5 if available
-    if mt5:
-        try:
-            import MetaTrader5 as mt5mod
-            if mt5mod.symbol_select(symbol, True):
-                info = mt5mod.symbol_info(symbol)
-                if info:
-                    digits   = info.digits
-                    point    = info.point
-                    min_pts  = getattr(info, 'trade_stops_level', min_pts)
-                    min_dist = min_pts * point
-        except Exception as e:
-            print(f"[Warning] live params fetch failed for {symbol}: {e}")
-
-    # SL/TP in pips from env
+    # our pip‐based minimum from SL_AMOUNT
     sl_pips = float(os.getenv('SL_AMOUNT', 2))
-    tp_pips = float(os.getenv('TP_AMOUNT', 3))
     pip_sz  = 0.01 if 'JPY' in symbol.upper() else 0.0001
+    min_dist_by_pip = sl_pips * pip_sz
 
-    # raw offsets
-    raw_sl_off = sl_pips * pip_sz
-    raw_tp_off = tp_pips * pip_sz
+    fx_pairs = {'EURUSD','USDJPY','USDCAD','NZDUSD'}
+    if symbol.upper() not in fx_pairs:
+        min_dist = min(raw_min_dist, min_dist_by_pip)
+    else:
+        min_dist = raw_min_dist
 
-    # base points
-    base_sl_pts = max(int(raw_sl_off/point), min_pts)
-    base_tp_pts = max(int(raw_tp_off/point), min_pts)
-
-    # apply buffer: 2× for USDCAD & NZDUSD, else 1.5×
-    buf = 2.0 if symbol.upper() in ('USDCAD', 'NZDUSD', 'USDJPY') else 1.5
-    sl_off = base_sl_pts * point * buf
-    tp_off = base_tp_pts * point * buf
+    # risk‐based distance = 1% of entry
+    risk_dist = entry_price * 0.01
+    sl_dist = max(risk_dist, min_dist)
+    tp_dist = sl_dist * 1.5
 
     if side.upper() == 'BUY':
-        sl_raw = entry_price - sl_off
-        tp_raw = entry_price + tp_off
+        sl = entry_price - sl_dist
+        tp = entry_price + tp_dist
     else:
-        sl_raw = entry_price + sl_off
-        tp_raw = entry_price - tp_off
+        sl = entry_price + sl_dist
+        tp = entry_price - tp_dist
 
-    # Debug logging
-    print(f"[Debug] {symbol} | side={side} | entry={entry_price} | opposite={opposite_price}")
-    print(f"[Debug] digits={digits}, point={point}, min_pts={min_pts}, min_dist={min_dist}")
-    print(f"[Debug] Offsets → SL={sl_off}, TP={tp_off}")
-    print(f"[Debug] Pre-round → SL={sl_raw}, TP={tp_raw}")
+    return {
+        'sl': round(sl, digits),
+        'tp': round(tp, digits),
+        'digits': digits
+    }
 
-    # round to broker precision
-    sl_level = round(sl_raw, digits)
-    tp_level = round(tp_raw, digits)
 
-    return {'sl_level': sl_level, 'tp_level': tp_level}
+def normalize_volume(desired: float, info) -> float:
+    """Raise volume up to the broker’s minimum/step—never skip."""
+    min_vol  = info.volume_min
+    step     = info.volume_step or min_vol
+    if desired <= min_vol:
+        return min_vol
+    steps = math.floor((desired - min_vol) / step)
+    return round(min_vol + steps * step, 5)
 
-def open_trade(mt5, symbol: str, signal: str, volume: float):
-    """Send a market order, iterating fill modes until success."""
-    if signal.upper() == "HOLD":
-        print(f"ℹ️ HOLD signal for {symbol}; skipping.")
-        return None
 
-    if mt5 is None:
-        print(f"🔸 MOCK {signal.upper()} {symbol} vol={volume}")
-        return {'mock': True}
-
+def open_trade(mt5, symbol: str, signal: str, strat_vol: float):
+    """Universal trade: detect symbol, normalize vol, compute levels, try all fillings."""
     import MetaTrader5 as mt5mod
-
-    if not mt5mod.symbol_select(symbol, True):
-        print(f"❌ symbol_select failed for {symbol}")
+    sig = signal.upper()
+    if sig == "HOLD":
+        print(f"ℹ️ Skipping HOLD for {symbol}")
         return None
 
-    tick = mt5mod.symbol_info_tick(symbol)
+    broker_sym, info = get_symbol_properties(mt5mod, symbol)
+    if not broker_sym:
+        print(f"❌ Symbol not found: {symbol}")
+        return None
+
+    # fetch live tick or fallback to last-close
+    tick = None
+    for _ in range(3):
+        tick = mt5mod.symbol_info_tick(broker_sym)
+        if tick: break
+        time.sleep(0.5)
     if not tick:
-        print(f"❌ No tick data for {symbol}")
-        return None
+        print(f"❌ No tick data for {broker_sym}, using last-close")
+        df = fetch_market_data(symbol)
+        entry = df["close"].iat[-1]
+    else:
+        entry = tick.ask if sig=='BUY' else tick.bid
 
-    entry    = tick.ask if signal.upper() == 'BUY' else tick.bid
-    opposite = tick.bid if signal.upper() == 'BUY' else tick.ask
+    vol = normalize_volume(strat_vol, info)
+    if vol != strat_vol:
+        print(f"🔄 Adjusted volume {strat_vol:.5f}→{vol:.5f}")
 
-    levels = compute_trade_levels(entry, opposite, signal, symbol, mt5)
-    sl, tp = levels['sl_level'], levels['tp_level']
-    print(f"[Debug] Order params → entry={entry}, SL={sl}, TP={tp}, vol={volume}")
+    lvl = compute_trade_levels(entry, sig, info, broker_sym)
+    print(f"[Debug] {broker_sym} | {sig} | entry={entry:.{lvl['digits']}f} SL={lvl['sl']} TP={lvl['tp']} vol={vol}")
 
-    deviation = int(os.getenv('MT5_DEVIATION', 20))
-    modes = [
-        mt5mod.ORDER_FILLING_RETURN,
-        mt5mod.ORDER_FILLING_IOC,
-        mt5mod.ORDER_FILLING_FOK,
-    ]
-
-    for idx, mode in enumerate(modes):
-        req = {
-            'action':       mt5mod.TRADE_ACTION_DEAL,
-            'symbol':       symbol,
-            'volume':       volume,
-            'type':         mt5mod.ORDER_TYPE_BUY if signal.upper()=='BUY' else mt5mod.ORDER_TYPE_SELL,
-            'price':        entry,
-            'sl':           sl,
-            'tp':           tp,
-            'deviation':    deviation,
-            'magic':        123456,
-            'comment':      'Live Trade',
-            'type_time':    mt5mod.ORDER_TIME_GTC,
-            'type_filling': mode,
-        }
+    # always try all three filling modes
+    modes = [mt5mod.ORDER_FILLING_RETURN, mt5mod.ORDER_FILLING_IOC, mt5mod.ORDER_FILLING_FOK]
+    req = {
+        'action':    mt5mod.TRADE_ACTION_DEAL,
+        'symbol':    broker_sym,
+        'volume':    vol,
+        'type':      mt5mod.ORDER_TYPE_BUY if sig=='BUY' else mt5mod.ORDER_TYPE_SELL,
+        'price':     entry,
+        'sl':        lvl['sl'],
+        'tp':        lvl['tp'],
+        'deviation': int(os.getenv('MT5_DEVIATION', 500)),
+        'magic':     123456,
+        'comment':   'AutoTrade',
+        'type_time': mt5mod.ORDER_TIME_GTC,
+    }
+    for mode in modes:
+        req['type_filling'] = mode
         res = mt5mod.order_send(req)
         if res.retcode == mt5mod.TRADE_RETCODE_DONE:
-            print(f"✅ Opened {signal.upper()} {symbol}: ticket={res.order}, SL={sl}, TP={tp} (mode={idx})")
+            print(f"✅ {sig} {broker_sym} ticket={res.order}")
             return res
-        else:
-            print(f"⚠️ Mode {idx} failed (retcode={res.retcode}); retrying…")
-            time.sleep(1)
+        print(f"⚠️ Mode {mode} failed: {res.comment}")
+        time.sleep(0.5)
 
-    print(f"❌ All fill modes failed for {symbol}")
+    print(f"❌ All modes failed for {broker_sym}")
     return None
 
+
 def close_trade(mt5, ticket, symbol):
-    """Close an existing position (or simulate it)."""
+    """Close position—retry price, use IOC."""
     if mt5 is None:
-        print(f"🔸 MOCK close ticket={ticket} for {symbol}")
-        return {'mock': True}, None
+        print(f"🔸 MOCK close {ticket} for {symbol}")
+        return {'mock':True}, None
 
     import MetaTrader5 as mt5mod
-    positions = mt5.positions_get(ticket=ticket)
+    positions = mt5mod.positions_get(ticket=ticket)
     if not positions:
-        print(f"❌ No position for ticket {ticket}")
+        print(f"❌ No position {ticket}")
         return None, None
-
     pos = positions[0]
-    order_type = (mt5mod.ORDER_TYPE_SELL
-                  if pos.type == mt5mod.ORDER_TYPE_BUY
-                  else mt5mod.ORDER_TYPE_BUY)
-    tick = mt5mod.symbol_info_tick(symbol)
-    if not tick:
-        print(f"❌ No tick data when closing {symbol}")
-        return None, None
+    broker_sym = pos.symbol
+    side = 'SELL' if pos.type==mt5mod.ORDER_TYPE_BUY else 'BUY'
 
-    price = tick.bid if order_type==mt5mod.ORDER_TYPE_BUY else tick.ask
+    price = None
+    for _ in range(3):
+        tick = mt5mod.symbol_info_tick(broker_sym)
+        if tick:
+            price = tick.bid if side=='BUY' else tick.ask
+            break
+        time.sleep(0.5)
+    if price is None:
+        price = pos.price_open
+
     req = {
         'action':       mt5mod.TRADE_ACTION_DEAL,
         'position':     ticket,
-        'symbol':       symbol,
+        'symbol':       broker_sym,
         'volume':       pos.volume,
-        'type':         order_type,
+        'type':         mt5mod.ORDER_TYPE_BUY if side=='BUY' else mt5mod.ORDER_TYPE_SELL,
         'price':        price,
-        'deviation':    10,
+        'deviation':    50,
         'magic':        123456,
         'comment':      'Close Trade',
         'type_time':    mt5mod.ORDER_TIME_GTC,
         'type_filling': mt5mod.ORDER_FILLING_IOC,
     }
     res = mt5mod.order_send(req)
-    if res.retcode == mt5mod.TRADE_RETCODE_DONE:
-        print(f"✅ Trade closed: ticket {ticket}")
-    else:
-        print(f"❌ Close failed (retcode={res.retcode})")
-    return res, price
+    if res.retcode in (mt5mod.TRADE_RETCODE_DONE, mt5mod.TRADE_RETCODE_DONE_PARTIAL):
+        print(f"✅ Closed {ticket}@{price:.5f}")
+        return res, price
+    print(f"❌ Close failed: {res.comment}")
+    return None, None
+
 
 def shutdown_mt5(mt5_module):
     """Cleanly shut down MT5 connection."""

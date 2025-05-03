@@ -1,5 +1,3 @@
-# app/trading.py
-
 import pandas as pd
 import numpy as np
 import random
@@ -8,9 +6,10 @@ import os
 from datetime import datetime
 
 from config import get_today_symbols, SL_AMOUNT, TP_AMOUNT, USE_MOCK_MT5
-from app.market_data import fetch_twelvedata
+from app.market_data import fetch_market_data
 from app.mt5_handler import initialize_mt5, shutdown_mt5, open_trade, close_trade
-from app.models.basic_model import BasicModel
+from app.models.momentum_model import MomentumModel as BasicModel
+from app.news import get_news_sentiment
 from app.telegram_bot import send_message, send_message_channel
 from app.state import increment_trade_count
 from app.risk_manager import RiskManager
@@ -18,27 +17,6 @@ from app.id_manager import IDManager
 
 MOCK_TRADE_HOLD_SECONDS = int(os.getenv("MOCK_TRADE_HOLD_SECONDS", 120))
 PRE_SIGNAL_WAIT        = 30  # seconds
-
-
-def fetch_market_data(mt5, symbol):
-    if mt5 and not USE_MOCK_MT5:
-        try:
-            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 100)
-            if rates is not None and len(rates):
-                return pd.DataFrame(rates)
-        except Exception as e:
-            print(f"[Error] MT5 data fetch for {symbol}: {e}")
-    try:
-        return fetch_twelvedata(symbol)
-    except Exception as e:
-        print(f"[Error] TwelveData fetch for {symbol}: {e}")
-    return pd.DataFrame({
-        "open":   np.random.rand(100),
-        "high":   np.random.rand(100),
-        "low":    np.random.rand(100),
-        "close":  np.random.rand(100),
-        "volume": np.random.randint(1,1000,size=100),
-    })
 
 
 def trading_job():
@@ -64,20 +42,29 @@ def trading_job():
         time.sleep(PRE_SIGNAL_WAIT)
 
         # 2) Fetch data & AI predict
-        df  = fetch_market_data(mt5, sym)
+        df  = fetch_market_data(sym)
         out = model.predict(df)
-        sig = out.get("signal", "HOLD").upper()
-        conf= out.get("confidence", 0.0)
-        pc  = out.get("predicted_change", 0.0)
-        ns  = out.get("news_sentiment", "N/A")
+        sig  = out.get("signal", "HOLD").upper()
+        conf = out.get("confidence", 0.0)
+        pc   = out.get("predicted_change", 0.0)
+
+        # 2b) News sentiment (live)
+        ns = get_news_sentiment(sym)
+
         sid = idm.next()
 
-        # 3) Determine entry price for display
+        # 3) Determine entry price
+        entry = None
         if mt5 and not USE_MOCK_MT5:
             import MetaTrader5 as mt5mod
-            tick  = mt5mod.symbol_info_tick(sym)
-            entry = tick.ask if sig == "BUY" else tick.bid
-        else:
+            # ensure symbol is loaded
+            mt5mod.symbol_select(sym, True)
+            tick = mt5mod.symbol_info_tick(sym)
+            if tick and (sig == "BUY" and tick.ask is not None or sig == "SELL" and tick.bid is not None):
+                entry = tick.ask if sig == "BUY" else tick.bid
+            else:
+                print(f"❌ No tick data for {sym}, falling back to last close.")
+        if entry is None:
             entry = df["close"].iloc[-1]
 
         # 4) Display-only SL/TP
@@ -95,7 +82,7 @@ def trading_job():
             f"Signal ID: {sid}\n"
             f"Pair/Asset:       {sym}\n"
             f"Predicted Change: {pc:.2f}%\n"
-            f"News Sentiment:   {ns}\n"
+            f"News Sentiment:   {ns:.1f}%\n"
             f"AI Signal:        {sig}\n"
             f"Confidence:       {conf:.1f}%\n\n"
             f"Entry:     {entry:.5f}\n"
@@ -113,7 +100,7 @@ def trading_job():
         send_message(f"<pre>{box}</pre>")
         send_message_channel(f"<pre>{box}</pre>")
 
-        # 6) Execute trade with SL/TP auto detection
+        # 6) Execute trade
         volume = rm.get_lot()
         res    = open_trade(mt5, sym, sig, volume)
         if not res or (hasattr(res, "retcode") and res.retcode != 0):
@@ -124,7 +111,7 @@ def trading_job():
         time.sleep(MOCK_TRADE_HOLD_SECONDS)
         close_trade(mt5, ticket, sym)
 
-        # 8) Compute profit and update stats
+        # 8) Profit & stats
         profit = 0.0
         if mt5 and hasattr(mt5, "history_deals_get"):
             try:

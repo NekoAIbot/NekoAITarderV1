@@ -43,7 +43,7 @@ TP_AMOUNT = float(os.getenv("TP_AMOUNT", 3.0))
 
 # Assets
 FOREX_MAJORS = ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD"]
-CRYPTO_ASSETS= ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","ADAUSDT","DOTUSDT","MATICUSDT"]
+CRYPTO_ASSETS= ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","ADAUSDT","DOTUSDT","XRPUSDT"]
 
 def get_today_symbols():
     weekday = datetime.utcnow().weekday()
