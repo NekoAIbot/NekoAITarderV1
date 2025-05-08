@@ -1,53 +1,66 @@
-import time
-import random
-import requests
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from config import NEWSAPI_KEY
+# app/news.py
 
-analyzer = SentimentIntensityAnalyzer()
+import os
+from datetime import datetime, timedelta
+import pandas as pd
 
-def fetch_headlines(symbol: str) -> list[str]:
-    """
-    Fetch latest 3 Forex headlines from NewsAPI mentioning our symbol.
-    """
-    pair = f"{symbol[:3]}/{symbol[3:]}"
-    url = "https://newsapi.org/v2/everything"
-    params = {
-        "q":        f"forex OR {pair}",
-        "pageSize": 3,
-        "apiKey":   NEWSAPI_KEY,
-        "language": "en",
-        "sortBy":   "publishedAt",
-    }
-    resp = requests.get(url, params=params, timeout=10).json()
-    articles = resp.get("articles", [])
-    titles = [a["title"] for a in articles]
-    print(f"[Debug][News] {symbol} fetched {len(titles)} headlines.")
-    return titles
+from newsapi import NewsApiClient
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
-def compute_sentiment(headlines: list[str]) -> float:
-    """
-    Run VADER on each headline, then average the compound scores.
-    Returns a percentage [-100…+100].
-    """
+# initialize clients
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
+if not NEWSAPI_KEY:
+    raise RuntimeError("Please set NEWSAPI_KEY in your environment")
+newsapi = NewsApiClient(api_key=NEWSAPI_KEY)
+vader   = SentimentIntensityAnalyzer()
+
+# map symbols to search queries (tweak as you like)
+QUERY_MAP = {
+    **{f"{c}USD": c for c in ["EUR","GBP","AUD","CAD","CHF","JPY","NZD"]},
+    **{f"{c}USDT": c for c in ["BTC","ETH","BNB","SOL","ADA","DOT","XRP"]},
+}
+
+def _fetch_headlines(symbol: str,
+                     from_dt: datetime,
+                     to_dt:   datetime) -> list[str]:
+    """Call NewsAPI everything endpoint for given time window."""
+    q = QUERY_MAP.get(symbol, symbol)
+    res = newsapi.get_everything(
+        q=q,
+        from_param=from_dt.isoformat(),
+        to=to_dt.isoformat(),
+        language="en",
+        page_size=100,
+    )
+    return [a["title"] for a in res.get("articles", [])]
+
+def _score_headlines(headlines: list[str]) -> float:
+    """Return average VADER compound score, or 0 if none."""
     if not headlines:
-        print("[Debug][News]   no headlines → sentiment=0.0")
         return 0.0
-    scores = []
-    for h in headlines:
-        vs = analyzer.polarity_scores(h)
-        print(f"[Debug][News]   \"{h}\" → compound={vs['compound']}")
-        scores.append(vs["compound"])
-    avg = sum(scores) / len(scores) * 100
-    print(f"[Debug][News]   avg compound→ {avg:.1f}%")
-    return avg
+    scores = [vader.polarity_scores(t)["compound"] for t in headlines]
+    return sum(scores) / len(scores)
 
 def get_news_sentiment(symbol: str) -> float:
-    """Fetch + analyze, with 1–2s delay to be gentle on API."""
-    try:
-        headlines = fetch_headlines(symbol)
-        time.sleep(random.uniform(1, 2))
-        return compute_sentiment(headlines)
-    except Exception as e:
-        print(f"[Warning][News] sentiment fetch failed for {symbol}: {e}")
-        return 0.0
+    """
+    Real‐time sentiment: fetch headlines from last hour, return avg compound*100.
+    """
+    to_dt   = datetime.utcnow()
+    from_dt = to_dt - timedelta(hours=1)
+    hl     = _fetch_headlines(symbol, from_dt, to_dt)
+    return _score_headlines(hl) * 100.0
+
+def get_news_series(symbol: str, index: pd.DatetimeIndex) -> pd.Series:
+    """
+    For historical backtests/training: for each timestamp in `index`,
+    fetch headlines in the prior bar window (assumes 1-min bars).
+    Returns a Series of same length.
+    """
+    sentiments = []
+    for ts in index:
+        # you may adjust the window to match your bar interval
+        from_dt = ts - timedelta(minutes=1)
+        to_dt   = ts
+        hl      = _fetch_headlines(symbol, from_dt, to_dt)
+        sentiments.append(_score_headlines(hl) * 100.0)
+    return pd.Series(sentiments, index=index)

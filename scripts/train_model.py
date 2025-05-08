@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# scripts/train_model.py
+
 import sys
 from pathlib import Path
 import joblib
@@ -10,41 +12,38 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config import FOREX_MAJORS, CRYPTO_ASSETS
-from app.models.ai_model import MomentumModel
-from app.market_data import fetch_market_data
-from app.news import get_news_sentiment
+from app.market_data   import fetch_market_data
+from app.news          import get_news_series
+from app.models.xgb_model import MomentumModel
 
 def main():
     symbols = FOREX_MAJORS + CRYPTO_ASSETS
-    model   = MomentumModel()
-    diagnostics = []
+    dfs, news_segs = [], []
 
+    print("🛠 Building unified training set…")
     for sym in symbols:
-        print(f"🛠  Training on {sym} …")
+        print(f"  – {sym}")
+        df = fetch_market_data(sym)                    # must return a pd.DataFrame with a DatetimeIndex
+        ns = get_news_series(sym, df.index)            # get one sentiment value per bar
+        df["symbol"] = sym
+        dfs.append(df)
+        news_segs.append(ns)
 
-        # 1) load your price data
-        df = fetch_market_data(sym)
+    # concatenate
+    big_df       = pd.concat(dfs)
+    big_news     = pd.concat(news_segs).sort_index()
+    print(f"→ training on {len(big_df)} total rows")
 
-        # 2) fetch one sentiment per symbol, then align it with df.index
-        news_score  = get_news_sentiment(sym)
-        news_series = pd.Series(news_score, index=df.index)
+    # fit our XGBoost model
+    model        = MomentumModel()
+    model.fit(big_df, big_news)
 
-        # 3) fit the model
-        model.fit(df, news_series)
+    # persist
+    out_path     = ROOT / "app" / "models" / "models" / "xgb_model.joblib"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model.pipeline, out_path)
 
-        # quick in-sample check
-        preds = model.predict(df, news_score)
-        diagnostics.append((sym, preds['signal'], preds['predicted_change']))
-
-    # 4) persist the trained pipeline
-    MODEL_PATH = ROOT / "models" / "rf_model.joblib"
-    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model.pipeline, MODEL_PATH)
-
-    print("✅ Training complete. Model saved to", MODEL_PATH)
-    print("Diagnostics (last-bar predictions):")
-    for sym, sig, change in diagnostics:
-        print(f"  • {sym}: {sig} ({change:.2f}%)")
+    print("✅ Done, model saved to", out_path)
 
 if __name__ == "__main__":
     main()
