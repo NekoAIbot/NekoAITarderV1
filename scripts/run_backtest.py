@@ -1,46 +1,47 @@
 #!/usr/bin/env python3
-# scripts/run_backtest.py
-
 import sys
 from pathlib import Path
 
-# project root → allow “app” imports
+# allow imports from project root
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config import FOREX_MAJORS, CRYPTO_ASSETS
-from app.backtester       import backtest_symbol
-from app.models.xgb_model import MomentumModel
+from app.backtester      import backtest_symbol
+from app.models.rf_model import RFModel
+from app.models.xgb_model import MomentumModel as XGBModel
+from app.models.lstm_model import LSTMModel
+from app.models.cnn_model import CNNModel
 
-def compute_stats(pl_list):
-    n       = len(pl_list)
-    total   = sum(pl_list)
-    avg     = total / n if n else 0.0
-    wins    = sum(1 for x in pl_list if x > 0)
-    win_pct = (wins / n * 100) if n else 0.0
-    return {"n": n, "total_pl": total, "avg_pl": avg, "win_rate": win_pct}
+SYMBOLS = FOREX_MAJORS + CRYPTO_ASSETS
 
-def main(symbols):
-    model     = MomentumModel()
-    overall   = []
+def compute_stats(pl):
+    n    = len(pl)
+    wins = sum(1 for p in pl if p>0)
+    return {
+        "n":        n,
+        "win_rate": wins/n*100 if n else 0.0,
+        "total":    sum(pl),
+        "avg":      sum(pl)/n if n else 0.0,
+    }
 
-    for sym in symbols:
-        print(f"\n🔍 Backtesting {sym} …")
-        pl_list = backtest_symbol(sym, model, fee_per_trade=0.0)
-        stats   = compute_stats(pl_list)
-        overall.extend(pl_list)
+def run_model(name, model):
+    print(f"\n🔍 Backtesting {name}")
+    all_pl = []
+    for s in SYMBOLS:
+        all_pl += list(backtest_symbol(s, model, fee_per_trade=0.0))
+    st = compute_stats(all_pl)
+    print(f"→ {name}: Trades={st['n']}, WinRate={st['win_rate']:.1f}%, "
+          f"AvgPL={st['avg']:.5f}, TotalPL={st['total']:.5f}")
 
-        print(f"→ {sym}: Trades={stats['n']}, WinRate={stats['win_rate']:.1f}%, "
-              f"AvgPL={stats['avg_pl']:.5f}, TotalPL={stats['total_pl']:.5f}")
+if __name__=="__main__":
+    rf   = RFModel()
+    xgb  = XGBModel()
+    lstm = LSTMModel()
+    cnn  = CNNModel()
 
-    tot = compute_stats(overall)
-    print(f"\n📈 Overall: Trades={tot['n']}, WinRate={tot['win_rate']:.1f}%," 
-          f" TotalPL={tot['total_pl']:.5f}")
-
-if __name__ == "__main__":
-    if len(sys.argv)>1:
-        syms = sys.argv[1:]
-    else:
-        syms = FOREX_MAJORS + CRYPTO_ASSETS
-    main(syms)
+    run_model("RF", rf)
+    run_model("XGB", xgb)
+    run_model("LSTM", lstm)
+    run_model("CNN", cnn)
