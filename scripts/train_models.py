@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-import sys, time
+# enable TF eager mode for all functions (so .fit / .save work correctly)
+import tensorflow as tf
+tf.config.run_functions_eagerly(True)
+
+import sys
+import time
+import shutil
 from pathlib import Path
 import joblib
 import pandas as pd
 
 # allow “app” imports
 ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path: sys.path.insert(0, str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from config            import FOREX_MAJORS, CRYPTO_ASSETS
 from app.market_data   import fetch_market_data
@@ -44,13 +51,22 @@ def train_and_save(name, ModelClass, df, news):
     print(f"\n🔧 Training {name}…")
     m = ModelClass()
     m.fit(df, news)
-    ext = "joblib" if hasattr(m, "pipeline") else "h5"
-    out = ROOT/"app"/"models"/f"{name.lower()}_best.{ext}"
+
+    # determine extension & path
+    if hasattr(m, "pipeline"):
+        ext = "joblib"
+    else:
+        ext = "keras"
+
+    out = ROOT / "app" / "models" / f"{name.lower()}_best.{ext}"
     out.parent.mkdir(exist_ok=True)
+
     if hasattr(m, "pipeline"):
         joblib.dump(m.pipeline, out)
     else:
+        # Keras .save will pick extension
         m.model.save(out)
+
     print(f"✅ Saved {name} to {out}")
     return m
 
@@ -59,32 +75,37 @@ def evaluate(name, model):
     all_pl = []
     for s in SYMBOLS:
         all_pl += list(backtest_symbol(s, model, fee_per_trade=0.0))
-    wins  = sum(1 for p in all_pl if p>0)
-    wrate = wins/len(all_pl)*100 if all_pl else 0.0
+    wins  = sum(1 for p in all_pl if p > 0)
+    wrate = wins / len(all_pl) * 100 if all_pl else 0.0
     tot   = sum(all_pl)
     print(f"→ {name}: Trades={len(all_pl)}, WinRate={wrate:.1f}%, TotalPL={tot:.3f}")
     return tot
 
 def main():
     df, news = build_dataset()
+
     rf   = train_and_save("RF",   RFModel,   df, news)
     xgb  = train_and_save("XGB",  XGBModel,  df, news)
     lstm = train_and_save("LSTM", LSTMModel, df, news)
     cnn  = train_and_save("CNN",  CNNModel,  df, news)
+
     results = {
         "RF":   evaluate("RF",   rf),
         "XGB":  evaluate("XGB",  xgb),
         "LSTM": evaluate("LSTM", lstm),
         "CNN":  evaluate("CNN",  cnn),
     }
+
     best = max(results, key=results.get)
     print(f"\n🏆 Best model: {best}")
-    # copy best to `best_model.*`
-    ext = "joblib" if best in ("RF","XGB") else "h5"
-    src = ROOT/"app"/"models"/f"{best.lower()}_best.{ext}"
-    dst = ROOT/"app"/"models"/f"best_model.{ext}"
-    joblib.copy(src, dst) if ext=="joblib" else __import__("shutil").copy(src, dst)
-    print(f"✅ Best saved to {dst}")
 
-if __name__=="__main__":
+    ext = "joblib" if best in ("RF", "XGB") else "keras"
+    src = ROOT / "app" / "models" / f"{best.lower()}_best.{ext}"
+    dst = ROOT / "app" / "models" / f"best_model.{ext}"
+
+    # use shutil.copy for all files
+    shutil.copy(src, dst)
+    print(f"✅ Best model saved to {dst}")
+
+if __name__ == "__main__":
     main()
