@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# at top of scripts/train_models.py, before importing tensorflow/keras
+import tensorflow as tf
+tf.config.run_functions_eagerly(True)
+
 import sys, time
 from pathlib import Path
 import joblib
