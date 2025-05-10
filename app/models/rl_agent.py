@@ -1,35 +1,27 @@
-import gym
-import numpy as np
-import pandas as pd
-import joblib
+import os
 from pathlib import Path
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from app.models.rl_env import TradingEnv
 
 MODEL_DIR  = Path(__file__).parent / "models"
 MODEL_FILE = MODEL_DIR / "rl_agent.zip"
 
 class RLAgent:
-    def __init__(self, lookback=20):
-        self.lookback = lookback
-        MODEL_DIR.mkdir(exist_ok=True)
-        if MODEL_FILE.exists():
-            self.agent = PPO.load(str(MODEL_FILE))
-        else:
-            # build a toy gym.Env around your market data
-            from .rl_env import TradingEnv
-            env = DummyVecEnv([lambda: TradingEnv()])
-            self.agent = PPO("MlpPolicy", env, verbose=0)
+    """
+    A real PPO‐based trading agent.
+    """
+    def __init__(self):
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        self.model = PPO.load(str(MODEL_FILE)) if MODEL_FILE.exists() else None
 
-    def fit(self, df: pd.DataFrame, news: pd.Series):
-        from .rl_env import TradingEnv
-        env = DummyVecEnv([lambda: TradingEnv(df=df, news=news)])
-        self.agent.set_env(env)
-        self.agent.learn(total_timesteps=10_000)
-        self.agent.save(str(MODEL_FILE))
+    def train(self, df, total_timesteps=50_000):
+        env = TradingEnv(df)
+        self.model = PPO("MlpPolicy", env, verbose=1)
+        self.model.learn(total_timesteps=total_timesteps)
+        self.model.save(str(MODEL_FILE))
 
-    def predict(self, df: pd.DataFrame, news: float):
-        from .rl_env import TradingEnv
-        env = DummyVecEnv([lambda: TradingEnv(df=df, news=news)])
-        action, _ = self.agent.predict(env.reset())
-        return {"signal": "BUY" if action==1 else "SELL", "confidence": 100.0}
+    def predict(self, df, news=None):
+        env = TradingEnv(df)
+        obs = env.reset()
+        action, _ = self.model.predict(obs, deterministic=True)
+        return {"signal": ["HOLD","BUY","SELL"][action], "confidence": 0.0, "predicted_change": 0.0}

@@ -5,6 +5,15 @@ from datetime import datetime
 
 load_dotenv()
 
+def _get_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    # drop inline comments and strip whitespace
+    cleaned = raw.split("#", 1)[0].strip()
+    try:
+        return float(cleaned)
+    except ValueError:
+        return default
+
 # Telegram
 TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
@@ -29,22 +38,25 @@ EXHAUSTIVE_SEARCH = os.getenv("EXHAUSTIVE_SEARCH", "false").lower() == "true"
 TESTING_MODE      = os.getenv("TESTING_MODE",      "false").lower() == "true"
 
 # Trading interval
-TRADING_INTERVAL_MINUTES = int(os.getenv("TRADING_INTERVAL_MINUTES", 5))
+TRADING_INTERVAL_MINUTES = int(os.getenv("TRADING_INTERVAL_MINUTES", "5"))
 
 # Position-sizing
-LOT_MIN            = float(os.getenv("LOT_MIN",            0.01))
-LOT_MAX            = float(os.getenv("LOT_MAX",            0.20))
-LOT_BASE           = float(os.getenv("LOT_BASE",           LOT_MIN))
-LOT_ADJUST_PERCENT = float(os.getenv("LOT_ADJUST_PERCENT", 10.0))
+LOT_MIN            = _get_float("LOT_MIN",            0.01)
+LOT_MAX            = _get_float("LOT_MAX",            0.20)
+LOT_BASE           = _get_float("LOT_BASE",           LOT_MIN)
+LOT_ADJUST_PERCENT = _get_float("LOT_ADJUST_PERCENT", 10.0)
 
 # SL/TP defaults
-SL_AMOUNT = float(os.getenv("SL_AMOUNT", 2.0))
-TP_AMOUNT = float(os.getenv("TP_AMOUNT", 3.0))
+SL_AMOUNT = _get_float("SL_AMOUNT", 2.0)
+TP_AMOUNT = _get_float("TP_AMOUNT", 3.0)
 
 # Assets
-FOREX_MAJORS = ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD"]
-CRYPTO_ASSETS= ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","ADAUSDT","DOTUSDT","XRPUSDT"]
+FOREX_MAJORS  = ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD"]
+CRYPTO_ASSETS = ["BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","ADAUSDT","DOTUSDT","XRPUSDT"]
 
 def get_today_symbols():
+    """
+    Weekdays: trade forex; weekends: trade crypto.
+    """
     weekday = datetime.utcnow().weekday()
     return FOREX_MAJORS if weekday < 5 else CRYPTO_ASSETS
