@@ -39,37 +39,47 @@ class BaseNN:
         X, y = self._windowed_data(df, news_s)
         m    = self.build_fn(input_shape=X.shape[1:])
         es   = EarlyStopping(patience=5, restore_best_weights=True)
-        m.fit(X, y, epochs=30, batch_size=32,
-              validation_split=0.1, callbacks=[es], verbose=1)
-        m.save(MODEL_DIR/self.name)
+        m.fit(
+            X, y,
+            epochs=30, batch_size=32,
+            validation_split=0.1,
+            callbacks=[es],
+            verbose=1
+        )
+        # save in Keras native format
+        m.save(MODEL_DIR / f"{self.name}.keras")
         self.model = m
 
     def predict(self, df: pd.DataFrame, news: float):
-        # take last lookback bars
         df2 = df.tail(self.lookback).copy()
         news_s = pd.Series(news, index=df2.index)
         feat_df = build_features(df2, news_s)
         if feat_df.shape[0] < self.lookback:
-            return {"signal":"HOLD","confidence":0.0,"predicted_change":0.0}
+            return {"signal": "HOLD", "confidence": 0.0, "predicted_change": 0.0}
         X = feat_df.values.reshape(1, self.lookback, -1)
-        p = float(self.model.predict(X)[0,0])
-        sig = "BUY" if p>0.5 else "SELL"
+        p = float(self.model.predict(X)[0, 0])
+        sig = "BUY" if p > 0.5 else "SELL"
         return {
             "signal":           sig,
-            "confidence":       max(p,1-p)*100,
-            "predicted_change": (p-(1-p))*100,
+            "confidence":       max(p, 1-p) * 100,
+            "predicted_change": (p - (1-p)) * 100,
         }
 
 def build_cnn(input_shape):
     m = Sequential([
         Input(shape=input_shape),
-        Conv1D(32,3,activation="relu"),
+        Conv1D(32, 3, activation="relu"),
         MaxPooling1D(2),
         Flatten(),
-        Dense(32,activation="relu"),
+        Dense(32, activation="relu"),
         Dense(1, activation="sigmoid")
     ])
-    m.compile("adam","binary_crossentropy",metrics=["accuracy"])
+    m.compile(
+        optimizer="adam",
+        loss="binary_crossentropy",
+        metrics=["accuracy"],
+        run_eagerly=True    # optional, but safe if you hit TF graph issues
+    )
     return m
 
 def build_lstm(input_shape):
@@ -80,9 +90,14 @@ def build_lstm(input_shape):
         Dropout(0.2),
         Dense(1, activation="sigmoid"),
     ])
-    m.compile("adam","binary_crossentropy",metrics=["accuracy"])
+    m.compile(
+        optimizer="adam",
+        loss="binary_crossentropy",
+        metrics=["accuracy"],
+        run_eagerly=True    # **this is the key fix**
+    )
     return m
 
-DenseModel = lambda: BaseNN("dense",   lambda input_shape: build_cnn(input_shape))  # or build_dense
-CNNModel   = lambda: BaseNN("cnn",     build_cnn)
-LSTMModel  = lambda: BaseNN("lstm",    build_lstm)
+DenseModel = lambda: BaseNN("dense", lambda input_shape: build_cnn(input_shape))
+CNNModel   = lambda: BaseNN("cnn",   build_cnn)
+LSTMModel  = lambda: BaseNN("lstm",  build_lstm)

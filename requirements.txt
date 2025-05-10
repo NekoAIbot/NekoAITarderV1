@@ -6,7 +6,6 @@ optuna
 tensorflow
 nltk
 newsapi-python
-MetaTrader5
 python-dotenv
 requests
 joblib
