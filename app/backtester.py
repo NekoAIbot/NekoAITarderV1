@@ -1,44 +1,40 @@
-import pandas as pd
 import numpy as np
-from app.market_data import fetch_twelvedata
-from app.trade_logger import log_trade
-from app.models.xgb_model import MomentumModel
+from app.market_data    import fetch_twelvedata
+from app.trade_logger   import log_trade
 
 def backtest_symbol(symbol: str,
-                    model: MomentumModel,
-                    fee_per_trade: float = 0.0):
+                    model,
+                    fee_per_trade: float = 0.0,
+                    min_confidence: float = 0.6):
     """
-    Runs a next-bar backtest on 1-min data for `symbol`.
-    For each bar t, predict on bars[:t], enter at open(t+1), exit at open(t+2).
+    Next-bar backtest. Only trade when model.confidence >= min_confidence.
     """
-    df = fetch_twelvedata(symbol)
+    df    = fetch_twelvedata(symbol)
     opens = df["open"].values
+    profits = []
 
-    trades = []
-    for t in range(model.lookback, len(df) - 2):
+    for t in range(model.lookback, len(df)-2):
         window = df.iloc[:t+1]
-        out = model.predict(window, news=0.0)
-        sig = out["signal"]
-        if sig == "HOLD":
+        out    = model.predict(window, news=0.0)
+        if out["signal"]=="HOLD" or out["confidence"]/100 < min_confidence:
             continue
 
-        entry_price = opens[t+1]
-        exit_price  = opens[t+2]
-        direction   = 1 if sig == "BUY" else -1
-        raw_pl      = direction * (exit_price - entry_price)
-        profit      = raw_pl - fee_per_trade
-        win         = profit > 0
+        entry = opens[t+1]
+        exit_ = opens[t+2]
+        dirn  = 1 if out["signal"]=="BUY" else -1
+        raw_pl= dirn*(exit_ - entry)
+        profit = raw_pl - fee_per_trade
+        win    = profit>0
 
-        # ★ Correctly pass all required args to log_trade
         log_trade(
             symbol=symbol,
-            signal=sig,
+            signal=out["signal"],
             volume=1.0,
-            entry_price=entry_price,
-            exit_price=exit_price,
+            entry_price=entry,
+            exit_price=exit_,
             profit=profit,
             win=win
         )
-        trades.append(profit)
+        profits.append(profit)
 
-    return np.array(trades)
+    return np.array(profits)

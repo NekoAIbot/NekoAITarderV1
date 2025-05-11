@@ -1,30 +1,40 @@
-# app/models/ensemble.py
+import numpy as np
+from .rf_model   import RFModel
+from .xgb_model  import MomentumModel as XGBModel
+from .lstm_model import LSTMModel
+from .cnn_model  import CNNModel
 
-from .xgb_model        import XGBModel
-from .lstm_model       import LSTMModel
-from .cnn_model        import CNNModel
-from .dense_nn_model   import DenseNNModel
+class EnsembleModel:
+    def __init__(self, lookback=20):
+        # instantiate each with same lookback
+        self.models = [
+            RFModel(), XGBModel(), LSTMModel(), CNNModel()
+        ]
+        self.lookback = lookback
 
-class Ensemble:
-    def __init__(self):
-        self.models = {
-            "xgb":   XGBModel(),
-            "lstm":  LSTMModel(),
-            "cnn":   CNNModel(),
-            "dense": DenseNNModel(),
+    def predict(self, df, news):
+        # collect each model's probability for “up”
+        ups = []
+        dns = []
+        for m in self.models:
+            out = m.predict(df, news)
+            # we assume .predict returns {"signal", "confidence", "predicted_change"}
+            # but we need proba. If pipeline: we can fetch proba:
+            if hasattr(m, "pipeline"):
+                feat = m.featurize(df, news).iloc[[-1]]
+                p0,p1 = m.pipeline.predict_proba(feat)[0]
+            else:
+                # for Keras: we treat confidence as p(up)
+                p1 = out["confidence"]/100
+                p0 = 1 - p1
+            ups.append(p1)
+            dns.append(p0)
+
+        avg_up = np.mean(ups)
+        avg_dn = np.mean(dns)
+        signal = "BUY" if avg_up>avg_dn else "SELL"
+        return {
+            "signal": signal,
+            "confidence": max(avg_up,avg_dn)*100,
+            "predicted_change": (avg_up-avg_dn)*100
         }
-
-    def backtest_all(self, symbol, fee_per_trade=0.0):
-        from app.backtester import backtest_symbol
-        results = {}
-        for name, m in self.models.items():
-            pl = backtest_symbol(symbol, m, fee_per_trade=fee_per_trade)
-            win_rate = (pl>0).mean() * 100 if len(pl) else 0.0
-            total_pl = pl.sum() if len(pl) else 0.0
-            results[name] = {"win_rate": win_rate, "total_pl": total_pl}
-        return results
-
-    def best_model_for(self, symbol):
-        stats = self.backtest_all(symbol)
-        best = max(stats.items(), key=lambda kv: kv[1]["win_rate"])[0]
-        return best, self.models[best]
