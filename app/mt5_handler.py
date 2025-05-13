@@ -31,7 +31,6 @@ def initialize_mt5():
     print("✅ MT5 initialized & logged in.")
     return mt5
 
-
 def get_symbol_properties(mt5mod, symbol: str):
     """Auto-detect the broker’s exact symbol name and return (name, info)."""
     variations = [
@@ -46,6 +45,18 @@ def get_symbol_properties(mt5mod, symbol: str):
                 return sym, info
     return None, None
 
+def _get_env_float(name: str, default: float) -> float:
+    """
+    Read an env var, strip any inline comment (# ...), and convert to float.
+    Falls back to default on parse error.
+    """
+    raw = os.getenv(name, str(default))
+    # drop anything after a '#' and strip whitespace
+    val = raw.split('#', 1)[0].strip()
+    try:
+        return float(val)
+    except ValueError:
+        return default
 
 def compute_trade_levels(entry_price: float,
                          side: str,
@@ -53,16 +64,16 @@ def compute_trade_levels(entry_price: float,
                          symbol: str) -> dict:
     """
     Calculate SL/TP:
-    - For FX (EURUSD, USDJPY, USDCAD, NZDUSD) we respect the broker's trade_stops_level.
-    - For everything else we clamp that to our own pip‐based minimum.
+    - For FX pairs we respect the broker's trade_stops_level.
+    - Otherwise we clamp to our pip‐based minimum.
     """
-    digits = info.digits
-    point  = info.point
+    digits       = info.digits
+    point        = info.point
     raw_min_dist = info.trade_stops_level * point
 
-    # our pip‐based minimum from SL_AMOUNT
-    sl_pips = float(os.getenv('SL_AMOUNT', 2))
-    pip_sz  = 0.01 if 'JPY' in symbol.upper() else 0.0001
+    # our pip‐based minimum from SL_AMOUNT (inline-comment safe)
+    sl_pips      = _get_env_float('SL_AMOUNT', 2.0)
+    pip_sz       = 0.01 if 'JPY' in symbol.upper() else 0.0001
     min_dist_by_pip = sl_pips * pip_sz
 
     fx_pairs = {'EURUSD','USDJPY','USDCAD','NZDUSD'}
@@ -73,8 +84,8 @@ def compute_trade_levels(entry_price: float,
 
     # risk‐based distance = 1% of entry
     risk_dist = entry_price * 0.01
-    sl_dist = max(risk_dist, min_dist)
-    tp_dist = sl_dist * 1.5
+    sl_dist   = max(risk_dist, min_dist)
+    tp_dist   = sl_dist * 1.5
 
     if side.upper() == 'BUY':
         sl = entry_price - sl_dist
@@ -84,11 +95,10 @@ def compute_trade_levels(entry_price: float,
         tp = entry_price - tp_dist
 
     return {
-        'sl': round(sl, digits),
-        'tp': round(tp, digits),
+        'sl':     round(sl, digits),
+        'tp':     round(tp, digits),
         'digits': digits
     }
-
 
 def normalize_volume(desired: float, info) -> float:
     """Raise volume up to the broker’s minimum/step—never skip."""
@@ -98,7 +108,6 @@ def normalize_volume(desired: float, info) -> float:
         return min_vol
     steps = math.floor((desired - min_vol) / step)
     return round(min_vol + steps * step, 5)
-
 
 def open_trade(mt5, symbol: str, signal: str, strat_vol: float):
     """Universal trade: detect symbol, normalize vol, compute levels, try all fillings."""
@@ -136,17 +145,17 @@ def open_trade(mt5, symbol: str, signal: str, strat_vol: float):
     # always try all three filling modes
     modes = [mt5mod.ORDER_FILLING_RETURN, mt5mod.ORDER_FILLING_IOC, mt5mod.ORDER_FILLING_FOK]
     req = {
-        'action':    mt5mod.TRADE_ACTION_DEAL,
-        'symbol':    broker_sym,
-        'volume':    vol,
-        'type':      mt5mod.ORDER_TYPE_BUY if sig=='BUY' else mt5mod.ORDER_TYPE_SELL,
-        'price':     entry,
-        'sl':        lvl['sl'],
-        'tp':        lvl['tp'],
-        'deviation': int(os.getenv('MT5_DEVIATION', 500)),
-        'magic':     123456,
-        'comment':   'AutoTrade',
-        'type_time': mt5mod.ORDER_TIME_GTC,
+        'action':      mt5mod.TRADE_ACTION_DEAL,
+        'symbol':      broker_sym,
+        'volume':      vol,
+        'type':        mt5mod.ORDER_TYPE_BUY if sig=='BUY' else mt5mod.ORDER_TYPE_SELL,
+        'price':       entry,
+        'sl':          lvl['sl'],
+        'tp':          lvl['tp'],
+        'deviation':   int(os.getenv('MT5_DEVIATION', 500)),
+        'magic':       123456,
+        'comment':     'AutoTrade',
+        'type_time':   mt5mod.ORDER_TIME_GTC,
     }
     for mode in modes:
         req['type_filling'] = mode
@@ -159,7 +168,6 @@ def open_trade(mt5, symbol: str, signal: str, strat_vol: float):
 
     print(f"❌ All modes failed for {broker_sym}")
     return None
-
 
 def close_trade(mt5, ticket, symbol):
     """Close position—retry price, use IOC."""
@@ -205,7 +213,6 @@ def close_trade(mt5, ticket, symbol):
         return res, price
     print(f"❌ Close failed: {res.comment}")
     return None, None
-
 
 def shutdown_mt5(mt5_module):
     """Cleanly shut down MT5 connection."""

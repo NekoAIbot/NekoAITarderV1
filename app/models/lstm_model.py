@@ -16,7 +16,7 @@ class LSTMModel:
     def __init__(self, lookback: int = 20):
         self.lookback = lookback
         if MODEL_FILE.exists():
-            # load without pulling in old optimizer state
+            # load without optimizer state
             self.model = load_model(MODEL_FILE, compile=False)
         else:
             self.model = Sequential([
@@ -29,29 +29,32 @@ class LSTMModel:
             ])
 
     def _prepare(self, df: pd.DataFrame, news: pd.Series):
-        # reset index
+        # reset to integer index
         df2 = df.reset_index(drop=True).copy()
-        n = len(df2)
-        vals = news.values
-        # align sentiment length: take last n or pad zeros
-        if len(vals) >= n:
-            aligned = vals[-n:]
-        else:
-            aligned = np.concatenate([np.zeros(n - len(vals)), vals])
-        news_s = pd.Series(aligned, index=df2.index)
+        n   = len(df2)
 
-        feat = build_features(df2, news_s)
-        Xs, ys = [], []
+        # align news by position (pad with 0 or truncate)
+        vals = news.values
+        if len(vals) < n:
+            vals = np.concatenate([vals, np.zeros(n - len(vals))])
+        else:
+            vals = vals[:n]
+        news_s = pd.Series(vals, index=df2.index)
+
+        # build features & targets
+        feat   = build_features(df2, news_s)
         closes = df2["close"].values
-        arr     = feat.values
+
+        Xs, ys = [], []
+        arr    = feat.values
         for i in range(self.lookback, len(arr) - 1):
-            Xs.append(arr[i - self.lookback : i])
-            ys.append(int(closes[i + 1] > closes[i]))
+            Xs.append(arr[i-self.lookback:i])
+            ys.append(int(closes[i+1] > closes[i]))
+
         return np.array(Xs), np.array(ys)
 
     def fit(self, df: pd.DataFrame, news: pd.Series):
         X, y = self._prepare(df, news)
-        # (re)compile with fresh optimizer each fit
         self.model.compile(
             optimizer="adam",
             loss="binary_crossentropy",
@@ -67,23 +70,28 @@ class LSTMModel:
             callbacks=[es],
             verbose=1
         )
-        # save in native Keras format
         self.model.save(MODEL_FILE)
 
     def predict(self, df: pd.DataFrame, news: float):
+        # prepare a df with integer index
         df2 = df.reset_index(drop=True).copy()
-        n = len(df2)
-        # build constant sentiment for last lookback
-        aligned = np.array([news] * n)
-        if n < self.lookback:
-            return {"signal":"HOLD","confidence":0.0,"predicted_change":0.0}
-        news_s = pd.Series(aligned, index=df2.index)
-        feat   = build_features(df2, news_s)
+        n   = len(df2)
+
+        # constant-news series aligned by position
+        vals = np.full(n, news, dtype=float)
+        news_s = pd.Series(vals, index=df2.index)
+
+        feat = build_features(df2, news_s)
         if len(feat) < self.lookback:
-            return {"signal":"HOLD","confidence":0.0,"predicted_change":0.0}
-        Xp = feat.values[-self.lookback :].reshape(1, self.lookback, -1)
+            return {"signal":"HOLD", "confidence":0.0, "predicted_change":0.0}
+
+        Xp = feat.values[-self.lookback:].reshape(1, self.lookback, -1)
         p  = float(self.model.predict(Xp)[0,0])
         sig = "BUY" if p > 0.5 else "SELL"
-        return {"signal":sig, "confidence":p*100, "predicted_change":(p-0.5)*200}
+        return {
+            "signal": sig,
+            "confidence": p * 100,
+            "predicted_change": (p - 0.5) * 200
+        }
 
 __all__ = ["LSTMModel"]
