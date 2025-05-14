@@ -10,11 +10,11 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from config                import FOREX_MAJORS, CRYPTO_ASSETS
-from app.market_data       import fetch_market_data
-from app.news              import get_news_sentiment
-from app.backtester        import backtest_symbol
-from app.models.xgb_model  import MomentumModel as XGBModel
+from config               import FOREX_MAJORS, CRYPTO_ASSETS
+from app.market_data      import fetch_market_data
+from app.news             import get_news_sentiment
+from app.backtester       import backtest_symbol
+from app.models.xgb_model import MomentumModel as XGBModel
 from app.models.lstm_model import LSTMModel
 from app.models.cnn_model  import CNNModel
 
@@ -41,17 +41,17 @@ def objective(trial):
     split = int(0.8 * len(df))
     tdf, vdf = df.iloc[:split].copy(), df.iloc[split:].copy()
     tdf.index, vdf.index = df.index[:split], df.index[split:]
-    tnews, vnews         = news.iloc[:split], news.iloc[split:]
+    tnews, vnews = news.iloc[:split], news.iloc[split:]
 
     # common HPs
-    lookback   = trial.suggest_int("lookback", 10, 50)
-    min_conf   = trial.suggest_float("min_confidence", 0.5, 0.9)
+    lookback = trial.suggest_int("lookback", 10, 50)
+    # allow very low confidence so we actually take trades
+    min_conf = trial.suggest_float("min_confidence", 0.0, 0.9)
     batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
 
     model_type = trial.suggest_categorical("model", ["xgb", "lstm", "cnn"])
 
     if model_type == "xgb":
-        # XGBoost hyperparams
         params = {
             "n_estimators":     trial.suggest_int("xgb_n_estimators", 50, 500, step=50),
             "max_depth":        trial.suggest_int("xgb_max_depth", 3, 12),
@@ -72,6 +72,7 @@ def objective(trial):
 
     elif model_type == "lstm":
         m = LSTMModel(lookback=lookback)
+        # note: make sure your LSTMModel supports a batch_size attribute
         m.batch_size = batch_size
         m.fit(tdf, tnews)
 
@@ -91,12 +92,17 @@ def objective(trial):
         )
         all_profits.extend(pf.tolist())
 
-    if len(all_profits) < 2:
-        return 0.0
+    profits = np.array(all_profits)
+    ntrades = len(profits)
 
-    rets   = np.array(all_profits)
-    sharpe = np.mean(rets) / (np.std(rets, ddof=1) + 1e-8)
-    # maximize Sharpe → minimize negative Sharpe
+    # if very few trades, use total P/L to give non-zero signal
+    if ntrades < 5:
+        score = profits.sum()
+        # We want to *minimize* the objective, so return negative total P/L
+        return -score
+
+    # otherwise compute Sharpe
+    sharpe = profits.mean() / (profits.std(ddof=1) + 1e-8)
     return -sharpe
 
 if __name__ == "__main__":
@@ -106,13 +112,13 @@ if __name__ == "__main__":
     print("Best params:", study.best_params)
     print("Retraining on full dataset…")
 
+    # final training
     df, news = build_dataset()
     best = study.best_params
 
-    # build final model
     lookback   = best.get("lookback", 20)
     batch_size = best.get("batch_size", 32)
-    min_conf   = best.get("min_confidence", 0.6)
+    min_conf   = best.get("min_confidence", 0.0)
 
     if best["model"] == "xgb":
         final = XGBModel(); final.lookback = lookback
@@ -124,13 +130,15 @@ if __name__ == "__main__":
             clf__colsample_bytree= best["xgb_col"],
         )
     elif best["model"] == "lstm":
-        final = LSTMModel(lookback=lookback); final.batch_size = batch_size
+        final = LSTMModel(lookback=lookback)
+        final.batch_size = batch_size
     else:
-        final = CNNModel(lookback=lookback); final.batch_size = batch_size
+        final = CNNModel(lookback=lookback)
+        final.batch_size = batch_size
 
     final.fit(df, news)
 
-    ext = "joblib" if best["model"] == "xgb" else "keras"
+    ext = "joblib" if best["model"]=="xgb" else "keras"
     out = ROOT / "app" / "models" / f"{best['model']}_tuned.{ext}"
     out.parent.mkdir(exist_ok=True)
     if hasattr(final, "pipeline"):
