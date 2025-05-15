@@ -1,20 +1,49 @@
 #!/usr/bin/env python3
-import sys
-from pathlib import Path
-import optuna
-import numpy as np
-import pandas as pd
+# ── PLACE THIS AT THE VERY TOP ───────────────────────────────────────────────
+import os, sys, warnings, contextlib, io
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-# allow imports from project root
+import tensorflow as tf
+tf.get_logger().setLevel("ERROR")
+
+warnings.filterwarnings("ignore", ".*Unable to register.*")
+warnings.filterwarnings("ignore", ".*computation placer already registered.*")
+warnings.filterwarnings("ignore", ".*use_label_encoder.*")
+
+# Monkey‑patch Keras fit to always run with verbose=0
+_K = tf.keras.Model
+_orig_fit = _K.fit
+def _silent_fit(self, *args, **kwargs):
+    kwargs.setdefault("verbose", 0)
+    return _orig_fit(self, *args, **kwargs)
+_K.fit = _silent_fit
+
+# ── UTILITY FOR SILENT FITTING (sklearn/XGB) ────────────────────────────────
+def silent_fit(model, *args, **kwargs):
+    if "verbose" not in kwargs:
+        kwargs["verbose"] = 0
+    buf_out, buf_err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+        try:
+            return model.fit(*args, **kwargs)
+        except TypeError as e:
+            if "verbose" in str(e):
+                kwargs.pop("verbose", None)
+                return model.fit(*args, **kwargs)
+            raise
+
+# ── REGULAR IMPORTS ─────────────────────────────────────────────────────────
+import optuna, numpy as np, pandas as pd
+from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from config               import FOREX_MAJORS, CRYPTO_ASSETS
-from app.market_data      import fetch_market_data
-from app.news             import get_news_sentiment
-from app.backtester       import backtest_symbol
-from app.models.xgb_model import MomentumModel as XGBModel
+from config                import FOREX_MAJORS, CRYPTO_ASSETS
+from app.market_data       import fetch_market_data
+from app.news              import get_news_sentiment
+from app.backtester        import backtest_symbol
+from app.models.xgb_model  import MomentumModel as XGBModel
 from app.models.lstm_model import LSTMModel
 from app.models.cnn_model  import CNNModel
 
@@ -30,27 +59,37 @@ def build_dataset():
             s = 0.0
         dfs.append(df.assign(symbol=sym))
         news.append(pd.Series(s, index=df.index))
-    big_df   = pd.concat(dfs).sort_index()
-    big_news = pd.concat(news).sort_index()
-    return big_df, big_news
+    return pd.concat(dfs).sort_index(), pd.concat(news).sort_index()
+
+def enrich_features(df):
+    df = df.copy()
+    df["sma5"]  = df["close"].rolling(5).mean()
+    df["sma20"] = df["close"].rolling(20).mean()
+    delta = df["close"].diff()
+    up, dn = delta.clip(lower=0), -delta.clip(upper=0)
+    rs = up.ewm(14).mean() / (dn.ewm(14).mean() + 1e-8)
+    df["rsi"] = 100 - 100/(1+rs)
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"]  - df["close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(14).mean()
+    return df.bfill().ffill()
 
 def objective(trial):
     df, news = build_dataset()
-
-    # 80/20 time split
-    split = int(0.8 * len(df))
-    tdf, vdf = df.iloc[:split].copy(), df.iloc[split:].copy()
-    tdf.index, vdf.index = df.index[:split], df.index[split:]
+    split = int(0.8*len(df))
+    tdf, vdf = df.iloc[:split], df.iloc[split:]
     tnews, vnews = news.iloc[:split], news.iloc[split:]
 
-    # common HPs
-    lookback = trial.suggest_int("lookback", 10, 50)
-    # allow very low confidence so we actually take trades
-    min_conf = trial.suggest_float("min_confidence", 0.0, 0.9)
-    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+    # hyperparams
+    lookback   = trial.suggest_int("lookback", 10, 50)
+    min_conf   = trial.suggest_float("min_confidence", 0.0, 0.9)
+    batch_size = trial.suggest_categorical("batch_size", [16,32,64])
+    model_type = trial.suggest_categorical("model", ["xgb","lstm","cnn"])
 
-    model_type = trial.suggest_categorical("model", ["xgb", "lstm", "cnn"])
-
+    # choose & train
     if model_type == "xgb":
         params = {
             "n_estimators":     trial.suggest_int("xgb_n_estimators", 50, 500, step=50),
@@ -68,60 +107,46 @@ def objective(trial):
             clf__colsample_bytree= params["colsample_bytree"],
         )
         m.lookback = lookback
-        m.fit(tdf, tnews)
+        silent_fit(m, tdf, tnews)
 
     elif model_type == "lstm":
         m = LSTMModel(lookback=lookback)
-        # note: make sure your LSTMModel supports a batch_size attribute
         m.batch_size = batch_size
-        m.fit(tdf, tnews)
+        silent_fit(m, tdf, tnews)
 
     else:  # cnn
         m = CNNModel(lookback=lookback)
         m.batch_size = batch_size
-        m.fit(tdf, tnews)
+        silent_fit(m, tdf, tnews)
 
-    # backtest on validation slice
-    all_profits = []
+    # backtest & score
+    profits = []
     for sym in pd.unique(vdf["symbol"]):
-        pf = backtest_symbol(
-            symbol         = sym,
-            model          = m,
-            fee_per_trade  = 0.0,
-            min_confidence = min_conf
-        )
-        all_profits.extend(pf.tolist())
+        pf = backtest_symbol(sym, m, fee_per_trade=0.0, min_confidence=min_conf)
+        profits.extend(pf.tolist())
+    profits = np.array(profits)
 
-    profits = np.array(all_profits)
-    ntrades = len(profits)
+    if len(profits) < 5:
+        pl = float(profits.sum()) if profits.size else 0.0
+        print(f"Trial#{trial.number}: few trades ({len(profits)}), P/L={pl:.4f}")
+        return -pl
 
-    # if very few trades, use total P/L to give non-zero signal
-    if ntrades < 5:
-        score = profits.sum()
-        # We want to *minimize* the objective, so return negative total P/L
-        return -score
-
-    # otherwise compute Sharpe
     sharpe = profits.mean() / (profits.std(ddof=1) + 1e-8)
+    print(f"Trial#{trial.number}: Sharpe={sharpe:.4f}")
     return -sharpe
 
-if __name__ == "__main__":
+if __name__=="__main__":
     study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=100)
+    study.optimize(objective, n_trials=100, show_progress_bar=False)
 
-    print("Best params:", study.best_params)
+    print("\nBest params:", study.best_params)
     print("Retraining on full dataset…")
 
-    # final training
     df, news = build_dataset()
     best = study.best_params
 
-    lookback   = best.get("lookback", 20)
-    batch_size = best.get("batch_size", 32)
-    min_conf   = best.get("min_confidence", 0.0)
-
     if best["model"] == "xgb":
-        final = XGBModel(); final.lookback = lookback
+        final = XGBModel(); final.lookback = best["lookback"]
         final.pipeline.set_params(
             clf__n_estimators=     best["xgb_n_estimators"],
             clf__max_depth=        best["xgb_max_depth"],
@@ -130,15 +155,15 @@ if __name__ == "__main__":
             clf__colsample_bytree= best["xgb_col"],
         )
     elif best["model"] == "lstm":
-        final = LSTMModel(lookback=lookback)
-        final.batch_size = batch_size
+        final = LSTMModel(lookback=best["lookback"])
+        final.batch_size = best["batch_size"]
     else:
-        final = CNNModel(lookback=lookback)
-        final.batch_size = batch_size
+        final = CNNModel(lookback=best["lookback"])
+        final.batch_size = best["batch_size"]
 
-    final.fit(df, news)
+    silent_fit(final, df, news)
 
-    ext = "joblib" if best["model"]=="xgb" else "keras"
+    ext = "joblib" if best["model"] == "xgb" else "keras"
     out = ROOT / "app" / "models" / f"{best['model']}_tuned.{ext}"
     out.parent.mkdir(exist_ok=True)
     if hasattr(final, "pipeline"):
