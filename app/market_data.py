@@ -1,42 +1,71 @@
 #!/usr/bin/env python3
 # File: app/market_data.py
 
-import json
 import time
 import random
 from pathlib import Path
 
 import requests
 import pandas as pd
+import yfinance as yf
 from config import TWELVEDATA_API_KEY, ALPHAVANTAGE_API_KEY
 
-# Cache configuration
-CACHE_DIR = Path.home() / ".nekoai" / "cache"
+# ── Cache configuration ───────────────────────────────────────────────────────
+
+CACHE_DIR = Path.home() / ".nekoai" / "cache" / "market_data"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-CACHE_TTL = 300  # seconds
+CACHE_TTL      = 300    # seconds before cache expires
+API_CALL_DELAY = 1.0    # seconds to wait after each symbol fetch
 
 def _read_cache(symbol: str) -> pd.DataFrame | None:
     path = CACHE_DIR / f"{symbol}_1m.json"
     if not path.exists() or (time.time() - path.stat().st_mtime) > CACHE_TTL:
         return None
-    return pd.read_json(path)
+    try:
+        df = pd.read_json(path, orient="split", convert_dates=True)
+        # restore the DatetimeIndex
+        return df.set_index(df.index.name or "index")
+    except Exception:
+        return None
 
 def _write_cache(symbol: str, df: pd.DataFrame):
     path = CACHE_DIR / f"{symbol}_1m.json"
-    df.to_json(path, orient="records")
+    df.to_json(path, orient="split", date_format="iso")
+
+# ── Symbol normalization ─────────────────────────────────────────────────────
+
+def _normalize_for_yf(symbol: str) -> str:
+    # FX pairs → e.g. EURUSD → EURUSD=X
+    if len(symbol) == 6 and not symbol.endswith("USDT"):
+        return f"{symbol}=X"
+    # Crypto USDT → BTCUSDT → BTC-USD
+    if symbol.endswith("USDT"):
+        return f"{symbol[:-4]}-USD"
+    return symbol
 
 def _normalize_symbol_for_api(symbol: str) -> str:
-    """
-    TwelveData expects, e.g. BTC/USD not BTC/USDT.
-    AlphaVantage expects from_symbol, to_symbol.
-    We'll map any *USDT* to USD here.
-    """
-    base = symbol[:-4] if symbol.endswith("USDT") else symbol[:3]
-    quote = "USD" if symbol.endswith("USDT") else symbol[3:]
+    # for TwelveData / AlphaVantage (base/quote)
+    if symbol.endswith("USDT"):
+        base, quote = symbol[:-4], "USD"
+    else:
+        base, quote = symbol[:3], symbol[3:]
     return f"{base}/{quote}"
 
+# ── yfinance primary ─────────────────────────────────────────────────────────
+
+def fetch_yfinance(symbol: str) -> pd.DataFrame:
+    yf_sym = _normalize_for_yf(symbol)
+    ticker = yf.Ticker(yf_sym)
+    hist   = ticker.history(period="7d", interval="1m", actions=False)
+    if hist.empty:
+        raise ValueError("yfinance returned no data")
+    df = hist.iloc[-100:][["Open","High","Low","Close","Volume"]]
+    df.columns = ["open","high","low","close","volume"]
+    return df
+
+# ── TwelveData fallback ───────────────────────────────────────────────────────
+
 def fetch_twelvedata(symbol: str) -> pd.DataFrame:
-    """Fetch 1-min bars from TwelveData, drop datetime, pause 10–15s."""
     pair = _normalize_symbol_for_api(symbol)
     resp = requests.get(
         "https://api.twelvedata.com/time_series",
@@ -45,30 +74,29 @@ def fetch_twelvedata(symbol: str) -> pd.DataFrame:
             "interval":   "1min",
             "outputsize": 100,
             "apikey":     TWELVEDATA_API_KEY,
-        },
-        timeout=10
+        }, timeout=10
     ).json()
-
     if "values" not in resp:
         raise ValueError(f"TwelveData error: {resp.get('message', resp)}")
 
-    df = pd.DataFrame(resp["values"])[::-1].reset_index(drop=True)
+    raw = pd.DataFrame(resp["values"])[::-1]
+    raw["datetime"] = pd.to_datetime(raw["datetime"])
+    raw = raw.set_index("datetime")
 
-    # drop datetime, ensure OHLCV
-    if "datetime" in df.columns:
-        df = df.drop(columns=["datetime"])
-    for col in ("open", "high", "low", "close", "volume"):
-        if col not in df.columns:
-            df[col] = 0.0
-    df = df[["open", "high", "low", "close", "volume"]].astype(float)
+    # ensure column exists before fillna
+    for col in ("open","high","low","close","volume"):
+        if col in raw.columns:
+            raw[col] = pd.to_numeric(raw[col], errors="coerce").fillna(0.0)
+        else:
+            raw[col] = 0.0
 
     time.sleep(random.uniform(10, 15))
-    return df
+    return raw[["open","high","low","close","volume"]]
+
+# ── AlphaVantage final fallback ───────────────────────────────────────────────
 
 def fetch_alphavantage(symbol: str) -> pd.DataFrame:
-    """Fetch 1-min FX bars from AlphaVantage, pause 10–15s."""
-    # same normalization
-    base, quote = (_normalize_symbol_for_api(symbol).split("/"))
+    base, quote = _normalize_symbol_for_api(symbol).split("/")
     resp = requests.get(
         "https://www.alphavantage.co/query",
         params={
@@ -78,65 +106,66 @@ def fetch_alphavantage(symbol: str) -> pd.DataFrame:
             "interval":    "1min",
             "outputsize":  "compact",
             "apikey":      ALPHAVANTAGE_API_KEY,
-        },
-        timeout=10
+        }, timeout=10
     ).json()
-
     key = "Time Series FX (1min)"
     if key not in resp:
         raise ValueError(f"AlphaVantage error: {resp}")
 
-    records = []
-    for vals in resp[key].values():
-        records.append({
-            "open":   float(vals["1. open"]),
-            "high":   float(vals["2. high"]),
-            "low":    float(vals["3. low"]),
-            "close":  float(vals["4. close"]),
-            "volume": float(vals.get("5. volume", 0.0)),
+    rows = []
+    for ts, vals in resp[key].items():
+        rows.append({
+            "datetime": pd.to_datetime(ts),
+            "open":     float(vals["1. open"]),
+            "high":     float(vals["2. high"]),
+            "low":      float(vals["3. low"]),
+            "close":    float(vals["4. close"]),
+            "volume":   float(vals.get("5. volume", 0.0)),
         })
-
-    df = pd.DataFrame(records)
-    for col in ("open", "high", "low", "close", "volume"):
-        if col not in df.columns:
-            df[col] = 0.0
-    df = df[["open", "high", "low", "close", "volume"]].astype(float)
-
+    df = pd.DataFrame(rows).set_index("datetime").sort_index()
     time.sleep(random.uniform(10, 15))
-    return df
+    return df[["open","high","low","close","volume"]]
+
+# ── Unified market-data API ──────────────────────────────────────────────────
 
 def fetch_market_data(symbol: str) -> pd.DataFrame:
     """
-    Return latest 100 1-min bars for `symbol`, with:
-      1) Cache (5 min)
-      2) TwelveData → pause
-      3) AlphaVantage → pause
-      4) Dummy
+    Return latest 100 1-min bars for `symbol`:
+      1) Cache (5-min TTL)
+      2) yfinance primary
+      3) TwelveData fallback
+      4) AlphaVantage final fallback
+      5) Throttle via API_CALL_DELAY
     """
-    # 1) Cache
     df = _read_cache(symbol)
     if df is not None:
         return df
 
-    # 2) TwelveData
+    # try in order
     try:
-        df = fetch_twelvedata(symbol)
-    except Exception as e:
-        print(f"⚠️ TwelveData failed for {symbol}: {e}")
-        # 3) AlphaVantage fallback
+        df = fetch_yfinance(symbol)
+    except Exception as e1:
+        print(f"⚠️ yfinance failed for {symbol}: {e1}")
         try:
-            df = fetch_alphavantage(symbol)
+            df = fetch_twelvedata(symbol)
         except Exception as e2:
-            print(f"⚠️ AlphaVantage failed for {symbol}: {e2}")
-            import numpy as np
-            df = pd.DataFrame({
-                "open":   np.random.rand(100),
-                "high":   np.random.rand(100),
-                "low":    np.random.rand(100),
-                "close":  np.random.rand(100),
-                "volume": np.random.randint(1, 1000, size=100),
-            })
+            print(f"⚠️ TwelveData failed for {symbol}: {e2}")
+            try:
+                df = fetch_alphavantage(symbol)
+            except Exception as e3:
+                print(f"⚠️ AlphaVantage failed for {symbol}: {e3}")
+                # dummy fallback
+                import numpy as np
+                idx = pd.date_range(end=pd.Timestamp.utcnow(), periods=100, freq="T")
+                df = pd.DataFrame({
+                    "open":   np.random.rand(100),
+                    "high":   np.random.rand(100),
+                    "low":    np.random.rand(100),
+                    "close":  np.random.rand(100),
+                    "volume": np.random.randint(1,1000,100),
+                }, index=idx)
 
-    # 4) Cache & return
+    # cache + throttle
     _write_cache(symbol, df)
+    time.sleep(API_CALL_DELAY)
     return df
