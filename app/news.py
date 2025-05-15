@@ -1,4 +1,5 @@
-# app/news.py
+#!/usr/bin/env python3
+# File: app/news.py
 
 import os
 import time
@@ -11,19 +12,19 @@ from newsapi import NewsApiClient, newsapi_exception
 
 # initialize clients
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
-newsapi = NewsApiClient(api_key=NEWSAPI_KEY) if NEWSAPI_KEY else None
-vader   = SentimentIntensityAnalyzer()
+newsapi      = NewsApiClient(api_key=NEWSAPI_KEY) if NEWSAPI_KEY else None
+vader        = SentimentIntensityAnalyzer()
 
 # map symbols to search queries
 QUERY_MAP = {
-    **{f"{c}USD": c for c in ["EUR","GBP","AUD","CAD","CHF","JPY","NZD"]},
-    **{f"{c}USDT": c for c in ["BTC","ETH","BNB","SOL","ADA","DOT","XRP"]},
+    **{f"{c}USD": c for c in ["EUR", "GBP", "AUD", "CAD", "CHF", "JPY", "NZD"]},
+    **{f"{c}USDT": c for c in ["BTC", "ETH", "BNB", "SOL", "ADA", "DOT", "XRP"]},
 }
 
 def _fetch_rss_headlines(symbol: str) -> list[str]:
     """Fetch titles from Google News RSS for a given symbol query."""
-    q = QUERY_MAP.get(symbol, symbol)
-    url = f"https://news.google.com/rss/search?q={q}"
+    q    = QUERY_MAP.get(symbol, symbol)
+    url  = f"https://news.google.com/rss/search?q={q}"
     feed = feedparser.parse(url)
     if feed.bozo or not feed.entries:
         return []
@@ -37,12 +38,13 @@ def _fetch_newsapi_headlines(symbol: str,
         return []
     q = QUERY_MAP.get(symbol, symbol)
     try:
+        # --- Here we stringify to ISO 8601 ---
         res = newsapi.get_everything(
-            q=q,
-            from_param=from_dt.isoformat(),
-            to=to_dt.isoformat(),
-            language="en",
-            page_size=50,
+            q           = q,
+            from_param  = from_dt.isoformat(),
+            to          = to_dt.isoformat(),
+            language    = "en",
+            page_size   = 50,
         )
     except newsapi_exception.NewsAPIException:
         return []
@@ -67,7 +69,7 @@ def get_news_sentiment(symbol: str) -> float:
 
     # 2) fallback to NewsAPI
     now = datetime.utcnow()
-    hl = _fetch_newsapi_headlines(symbol, now - timedelta(hours=1), now)
+    hl  = _fetch_newsapi_headlines(symbol, now - timedelta(hours=1), now)
     return _score_headlines(hl) * 100.0
 
 def get_news_series(symbol: str, index: pd.DatetimeIndex) -> pd.Series:
@@ -78,7 +80,7 @@ def get_news_series(symbol: str, index: pd.DatetimeIndex) -> pd.Series:
     """
     sentiments = []
     for ts in index:
-        # 1–minute window
+        # 1‑minute window
         from_dt = ts - timedelta(minutes=1)
         to_dt   = ts
 
@@ -86,7 +88,7 @@ def get_news_series(symbol: str, index: pd.DatetimeIndex) -> pd.Series:
         if not sentiments:
             rss = _fetch_rss_headlines(symbol)
             if rss:
-                score = _score_headlines(rss) * 100.0
+                score      = _score_headlines(rss) * 100.0
                 sentiments = [score] * len(index)
                 break
 
