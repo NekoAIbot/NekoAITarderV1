@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
-import os, warnings
+import os
+import warnings
 import sys
 from pathlib import Path
+
+# ── 0) Fix NLTK VADER missing-lexicon issue ──────────────────────────────────
+import nltk
+nltk.download("vader_lexicon", quiet=True)
+
+# ── 1) Suppress noisy logs ──────────────────────────────────────────────────
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+warnings.filterwarnings("ignore", ".*use_label_encoder.*")
+
+# ── 2) Standard imports ────────────────────────────────────────────────────
 import numpy as np
 import pandas as pd
 from datetime import timedelta
@@ -10,15 +21,12 @@ from sklearn.pipeline import Pipeline, FeatureUnion
 from sklearn.preprocessing import StandardScaler
 import joblib
 
-# suppress TF/XGB logs
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-warnings.filterwarnings("ignore", ".*use_label_encoder.*")
-
-# project imports
+# allow imports from project root
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+# ── 3) Project imports ──────────────────────────────────────────────────────
 from config                import FOREX_MAJORS, CRYPTO_ASSETS
 from app.market_data       import fetch_market_data
 from app.news              import get_news_sentiment
@@ -32,6 +40,11 @@ SYMBOLS = FOREX_MAJORS + CRYPTO_ASSETS
 # ──────────────────────────────────────────────────────────────────────────────
 # 1) FEATURE ENGINEERING
 # ──────────────────────────────────────────────────────────────────────────────
+class ColumnSelector(BaseEstimator, TransformerMixin):
+    def __init__(self, cols): self.cols = cols
+    def fit(self, X, y=None): return self
+    def transform(self, X): return X[self.cols]
+
 class TechnicalsTransformer(BaseEstimator, TransformerMixin):
     """Compute SMA, RSI, ATR and drop raw OHLC."""
     def fit(self, X, y=None): return self
@@ -52,10 +65,9 @@ class TechnicalsTransformer(BaseEstimator, TransformerMixin):
         return df[["sma5","sma20","rsi","atr"]].bfill().ffill()
 
 class SentimentTransformer(BaseEstimator, TransformerMixin):
-    """Fetch single headline-score per bar."""
+    """Fetch single headline‑score per bar."""
     def fit(self, X, y=None): return self
     def transform(self, X):
-        # X is DataFrame with index and a "symbol" column
         scores = []
         for ts, sym in zip(X.index, X["symbol"]):
             try:
@@ -69,38 +81,31 @@ def build_feature_pipeline():
     return FeatureUnion([
         ("tech", Pipeline([
             ("select", ColumnSelector(["open","high","low","close"])),
-            ("tech", TechnicalsTransformer()),
-            ("scale", StandardScaler())
+            ("tech",   TechnicalsTransformer()),
+            ("scale",  StandardScaler())
         ])),
         ("sent", Pipeline([
             ("select", ColumnSelector(["symbol"])),
-            ("news", SentimentTransformer()),
-            ("scale", StandardScaler())
-        ]))
+            ("sent",   SentimentTransformer()),
+            ("scale",  StandardScaler())
+        ])),
     ])
-
-class ColumnSelector(BaseEstimator, TransformerMixin):
-    def __init__(self, cols): self.cols = cols
-    def fit(self, X, y=None): return self
-    def transform(self, X): return X[self.cols]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 2) DATA LOADING & SPLIT
 # ──────────────────────────────────────────────────────────────────────────────
 def load_all_data():
-    frames, news = [], []
+    frames = []
     for sym in SYMBOLS:
         df = fetch_market_data(sym).assign(symbol=sym)
         frames.append(df)
-        # news placeholder, merged later via transformer
     return pd.concat(frames).sort_index()
 
 def time_series_cv(df, n_splits=3, train_size=0.6, test_size=0.2):
-    """Yield (train_idx, test_idx) for rolling CV."""
     N = len(df)
     step = int((N - train_size*N - test_size*N)/(n_splits-1))
     for i in range(n_splits):
-        start = int(i*step)
+        start    = int(i*step)
         train_end = start + int(train_size*N)
         test_end  = train_end + int(test_size*N)
         yield (df.index[start:train_end], df.index[train_end:test_end])
@@ -112,17 +117,15 @@ def evaluate_model(name, model, df, feature_pipe, min_confidence, fee):
     records = []
     for fold, (tr_idx, te_idx) in enumerate(time_series_cv(df)):
         Xtr, Xte = df.loc[tr_idx], df.loc[te_idx]
-        ytr = (Xtr["close"].shift(-1) > Xtr["close"]).astype(int)
-        # train feature pipeline + model
+        # train features & model
         Xt_tr = feature_pipe.fit_transform(Xtr)
         model.lookback = 20
         if hasattr(model, "pipeline"):
-            # XGBModel expects full df,news inputs
             model.fit(Xtr, None)
         else:
             model.batch_size = 32
             model.fit(Xtr, None)
-        # backtest on te_idx
+        # backtest
         rets = []
         for sym in Xte["symbol"].unique():
             pf = backtest_symbol(
@@ -133,7 +136,7 @@ def evaluate_model(name, model, df, feature_pipe, min_confidence, fee):
             )
             rets.extend(pf.tolist())
         rets = np.array(rets)
-        if len(rets)<2:
+        if len(rets) < 2:
             metrics = {"fold":fold, "n_trades":len(rets), "pl":rets.sum(),
                        "sharpe":np.nan, "sortino":np.nan}
         else:
@@ -147,18 +150,17 @@ def evaluate_model(name, model, df, feature_pipe, min_confidence, fee):
     return dfm
 
 if __name__=="__main__":
-    df = load_all_data()
-    feature_pipe = build_feature_pipeline()
-    results = []
+    df            = load_all_data()
+    feature_pipe  = build_feature_pipeline()
+    results       = []
 
-    # instantiate models
+    # instantiate & evaluate each model
     configs = {
-        "XGBoost": (XGBModel(),   {"min_confidence":0.5, "fee":0.0001}),
-        "LSTM":    (LSTMModel(),  {"min_confidence":0.4, "fee":0.0001}),
-        "CNN":     (CNNModel(),   {"min_confidence":0.4, "fee":0.0001}),
+        "XGBoost": (XGBModel(), {"min_confidence":0.5, "fee":0.0001}),
+        "LSTM":    (LSTMModel(),{"min_confidence":0.4, "fee":0.0001}),
+        "CNN":     (CNNModel(), {"min_confidence":0.4, "fee":0.0001}),
     }
-
-    for name, (model, params) in configs.items():
+    for name,(model,params) in configs.items():
         print(f"\n>>> Evaluating {name}")
         dfm = evaluate_model(
             name=name,
@@ -169,11 +171,10 @@ if __name__=="__main__":
             fee=params["fee"]
         )
         results.append(dfm)
-        # save model
         joblib.dump(model, ROOT/f"models/{name}_final.pkl")
 
-    # compile & report
-    report = pd.concat(results, ignore_index=True)
+    # aggregate & report
+    report  = pd.concat(results, ignore_index=True)
     report.to_csv(ROOT/"backtest_report.csv", index=False)
     summary = (report.groupby("model")
                      .agg(trades=("n_trades","sum"),
@@ -183,4 +184,4 @@ if __name__=="__main__":
     print("\n=== AGGREGATED RESULTS ===")
     print(summary)
     summary.to_csv(ROOT/"backtest_summary.csv")
-    print("\nFull report written to backtest_report.csv/backtest_summary.csv")
+    print("\nFull report written to backtest_report.csv and backtest_summary.csv")

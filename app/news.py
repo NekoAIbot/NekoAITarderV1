@@ -5,22 +5,22 @@ import os
 import time
 from datetime import datetime, timedelta
 import pandas as pd
+
 import feedparser
 import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from newsapi import NewsApiClient, newsapi_exception
 
-# Ensure VADER lexicon is available
+# ── Ensure VADER lexicon is present ───────────────────────────────────────────
 try:
-    from nltk.sentiment.vader import SentimentIntensityAnalyzer
-    _ = SentimentIntensityAnalyzer()
-except (LookupError, ImportError):
+    nltk.data.find("sentiment/vader_lexicon/vader_lexicon.txt")
+except LookupError:
     nltk.download("vader_lexicon", quiet=True)
-    from nltk.sentiment.vader import SentimentIntensityAnalyzer
 
 # initialize clients
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
-newsapi     = NewsApiClient(api_key=NEWSAPI_KEY) if NEWSAPI_KEY else None
-vader       = SentimentIntensityAnalyzer()
+newsapi      = NewsApiClient(api_key=NEWSAPI_KEY) if NEWSAPI_KEY else None
+vader        = SentimentIntensityAnalyzer()
 
 # map symbols to search queries
 QUERY_MAP = {
@@ -65,8 +65,8 @@ def _score_headlines(headlines: list[str]) -> float:
 
 def get_news_sentiment(symbol: str) -> float:
     """
-    Real‑time sentiment: try RSS from last hour, fallback to NewsAPI.
-    Returns average compound score * 100.
+    Real‐time sentiment: try RSS from last hour, fallback to NewsAPI.
+    Returns avg compound*100.
     """
     # 1) RSS (no timestamp)
     rss = _fetch_rss_headlines(symbol)
@@ -81,15 +81,16 @@ def get_news_sentiment(symbol: str) -> float:
 def get_news_series(symbol: str, index: pd.DatetimeIndex) -> pd.Series:
     """
     For historical backtests/training: for each timestamp in `index`,
-    try RSS once, else fallback to NewsAPI per bar (throttled).
+    try RSS + fallback to NewsAPI in that bar window.
     Returns a Series aligned to `index`.
     """
     sentiments = []
     for ts in index:
+        # 1‑minute window
         from_dt = ts - timedelta(minutes=1)
         to_dt   = ts
 
-        # try RSS once per run
+        # try RSS once per symbol per training run
         if not sentiments:
             rss = _fetch_rss_headlines(symbol)
             if rss:
@@ -97,11 +98,12 @@ def get_news_series(symbol: str, index: pd.DatetimeIndex) -> pd.Series:
                 sentiments = [score] * len(index)
                 break
 
+        # otherwise fallback per-bar (but throttle)
         hl = _fetch_newsapi_headlines(symbol, from_dt, to_dt)
         sentiments.append(_score_headlines(hl) * 100.0)
         time.sleep(1)  # throttle NewsAPI calls
 
-    # pad/truncate to match length
+    # if we filled once via RSS, `sentiments` is full; else build from appended
     if len(sentiments) != len(index):
         sentiments = sentiments[:len(index)]
 
