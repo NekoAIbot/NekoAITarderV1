@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # File: app/mt5_handler.py
-
+#Neko
 import os
 import time
 import math
@@ -17,12 +17,9 @@ def send_telegram(msg: str):
         _raw_send(msg)
     except requests.HTTPError as e:
         if e.response.status_code == 429:
-            retry = int(
-                e.response
-                 .json()
-                 .get("parameters", {})
-                 .get("retry_after", 1)
-            )
+            retry = int(e.response.json()
+                            .get("parameters", {})
+                            .get("retry_after", 1))
             print(f"⚠️ Telegram 429, retry after {retry}s")
             time.sleep(retry)
             _raw_send(msg)
@@ -63,39 +60,36 @@ def get_symbol_properties(mt5mod, symbol: str):
     return None, None
 
 def _get_env_float(name: str, default: float) -> float:
-    """
-    Read an env var, strip any inline comment (# ...), and convert to float.
-    Falls back to default on parse error.
-    """
     raw = os.getenv(name, str(default))
-    # drop anything after a '#' and strip whitespace
-    val = raw.split('#', 1)[0].strip()
+    val = raw.split("#", 1)[0].strip()
     try:
         return float(val)
     except ValueError:
         return default
 
-def compute_trade_levels(entry_price: float,
-                         side: str,
-                         info,
-                         symbol: str) -> dict:
+def compute_trade_levels(entry_price, side, info, symbol):
     """
-    Calculate SL/TP:
-    - For FX pairs we respect the broker's trade_stops_level.
-    - Otherwise we clamp to our pip‐based minimum.
+    Given an entry price and side, compute stop‑loss and take‑profit levels
+    that respect both broker min distance and an SL‑as‑percentage fallback.
     """
     digits       = info.digits
     point        = info.point
     raw_min_dist = info.trade_stops_level * point
 
-    # our pip‐based minimum from SL_AMOUNT (inline-comment safe)
-    sl_pips      = _get_env_float('SL_AMOUNT', 2.0)
-    pip_sz       = 0.01 if 'JPY' in symbol.upper() else 0.0001
-    min_dist_by_pip = sl_pips * pip_sz
+    # user‑configurable SL in pips
+    sl_pips    = _get_env_float("SL_AMOUNT", 2.0)
+    # pip size: 0.01 for JPY pairs, 0.0001 otherwise
+    pip_sz     = 0.01 if "JPY" in symbol else 0.0001
+    min_by_pip = sl_pips * pip_sz
 
+    # for major FX pairs, enforce broker's raw minimum; otherwise use the tighter of the two
     fx_pairs = {"EURUSD", "USDJPY", "USDCAD", "NZDUSD"}
-    min_dist = raw_min_dist if symbol.upper() in fx_pairs else min(raw_min_dist, min_by_pip)
+    if symbol.upper() in fx_pairs:
+        min_dist = raw_min_dist
+    else:
+        min_dist = min(raw_min_dist, min_by_pip)
 
+    # also ensure SL is at least 1% of entry price
     risk_dist = entry_price * 0.01
     sl_dist   = max(risk_dist, min_dist)
     tp_dist   = sl_dist * 1.5
@@ -108,22 +102,24 @@ def compute_trade_levels(entry_price: float,
         tp = entry_price - tp_dist
 
     return {
-        'sl':     round(sl, digits),
-        'tp':     round(tp, digits),
-        'digits': digits
+        "sl": round(sl, digits),
+        "tp": round(tp, digits),
+        "digits": digits
     }
 
-def normalize_volume(desired: float, info) -> float:
-    """Raise volume up to the broker’s minimum/step—never skip."""
-    min_vol  = info.volume_min
-    step     = info.volume_step or min_vol
+def normalize_volume(desired, info):
+    min_vol = info.volume_min
+    step    = info.volume_step or min_vol
     if desired <= min_vol:
         return min_vol
     steps = math.floor((desired - min_vol) / step)
     return round(min_vol + steps * step, 5)
 
-def open_trade(mt5, symbol: str, signal: str, strat_vol: float):
-    """Universal trade: detect symbol, normalize vol, compute levels, try all fillings."""
+def open_trade(mt5, symbol, signal, strat_vol):
+    """
+    Try to open a trade.
+    If all filling modes fail due to position‑limit, auto‑close profitable positions.
+    """
     import MetaTrader5 as mt5mod
 
     sig = signal.upper()
@@ -143,28 +139,32 @@ def open_trade(mt5, symbol: str, signal: str, strat_vol: float):
         if tick:
             break
         time.sleep(0.5)
-    entry = (tick.ask if sig == "BUY" else tick.bid) if tick else fetch_market_data(symbol)["close"].iat[-1]
+    entry = (tick.ask if sig == "BUY" else tick.bid) \
+            if tick else fetch_market_data(symbol)["close"].iat[-1]
 
     vol = normalize_volume(strat_vol, info)
     if vol != strat_vol:
         print(f"🔄 Adjusted volume {strat_vol:.5f}→{vol:.5f}")
 
     lvl = compute_trade_levels(entry, sig, info, broker_sym)
-    print(f"[Debug] {broker_sym}|{sig}|entry={entry:.{lvl['digits']}f} SL={lvl['sl']} TP={lvl['tp']} vol={vol}")
+    print(f"[Debug] {broker_sym}|{sig}|entry={entry:.{lvl['digits']}f} "
+          f"SL={lvl['sl']} TP={lvl['tp']} vol={vol}")
 
-    modes = [mt5mod.ORDER_FILLING_RETURN, mt5mod.ORDER_FILLING_IOC, mt5mod.ORDER_FILLING_FOK]
+    modes = [mt5mod.ORDER_FILLING_RETURN,
+             mt5mod.ORDER_FILLING_IOC,
+             mt5mod.ORDER_FILLING_FOK]
     req = {
-        'action':      mt5mod.TRADE_ACTION_DEAL,
-        'symbol':      broker_sym,
-        'volume':      vol,
-        'type':        mt5mod.ORDER_TYPE_BUY if sig=='BUY' else mt5mod.ORDER_TYPE_SELL,
-        'price':       entry,
-        'sl':          lvl['sl'],
-        'tp':          lvl['tp'],
-        'deviation':   int(os.getenv('MT5_DEVIATION', 500)),
-        'magic':       123456,
-        'comment':     'AutoTrade',
-        'type_time':   mt5mod.ORDER_TIME_GTC,
+        "action":      mt5mod.TRADE_ACTION_DEAL,
+        "symbol":      broker_sym,
+        "volume":      vol,
+        "type":        mt5mod.ORDER_TYPE_BUY if sig == "BUY" else mt5mod.ORDER_TYPE_SELL,
+        "price":       entry,
+        "sl":          lvl["sl"],
+        "tp":          lvl["tp"],
+        "deviation":   int(os.getenv("MT5_DEVIATION", 500)),
+        "magic":       123456,
+        "comment":     "AutoTrade",
+        "type_time":   mt5mod.ORDER_TIME_GTC,
     }
 
     for mode in modes:
@@ -189,11 +189,12 @@ def open_trade(mt5, symbol: str, signal: str, strat_vol: float):
         for p in pos_list:
             side_p = "BUY" if p.type == mt5mod.ORDER_TYPE_BUY else "SELL"
             lines.append(
-                f" • ticket={p.ticket} side={side_p} vol={p.volume:.2f} open={p.price_open:.{info.digits}f}"
+                f" • ticket={p.ticket} side={side_p} vol={p.volume:.2f} "
+                f"open={p.price_open:.{info.digits}f}"
             )
         send_telegram("\n".join(lines))
 
-        # auto-close winning ones
+        # auto‑close winning ones
         for p in pos_list:
             side_p = "BUY" if p.type == mt5mod.ORDER_TYPE_BUY else "SELL"
             tick = mt5mod.symbol_info_tick(broker_sym)
@@ -221,6 +222,7 @@ def close_trade(mt5, ticket, symbol):
     pos = positions[0]
     side = "SELL" if pos.type == mt5mod.ORDER_TYPE_BUY else "BUY"
 
+    # fetch price
     for _ in range(3):
         t = mt5mod.symbol_info_tick(symbol)
         if t:
@@ -253,6 +255,42 @@ def close_trade(mt5, ticket, symbol):
     print(f"❌ Close failed: {res.comment}")
     send_telegram(f"❌ Close failed for {ticket}: {res.comment}")
     return None, None
+
+def monitor_positions(mt5):
+    """
+    Periodically call to report P/L on all open positions.
+    Aggregates all >0.1% P/L changes into one message per run.
+    """
+    import MetaTrader5 as mt5mod
+    if mt5 is None:
+        return
+
+    if not hasattr(monitor_positions, "_cache"):
+        monitor_positions._cache = {}
+
+    updates = []
+    for p in mt5mod.positions_get() or []:
+        ticket = p.ticket
+        symbol = p.symbol
+        side   = "BUY" if p.type == mt5mod.ORDER_TYPE_BUY else "SELL"
+        open_p = p.price_open
+        tick   = mt5mod.symbol_info_tick(symbol)
+        if not tick:
+            continue
+        now_p  = tick.bid if side == "BUY" else tick.ask
+        pl     = (now_p - open_p) * (1 if side == "BUY" else -1) * p.volume
+        last   = monitor_positions._cache.get(ticket, 0.0)
+        if abs(pl - last) / (abs(last) + 1e-8) > 0.001:
+            updates.append((ticket, symbol, side, p.volume, pl))
+            monitor_positions._cache[ticket] = pl
+
+    if updates:
+        lines = ["📊 Position P/L updates:"]
+        for t, s, sd, v, pl in updates:
+            lines.append(f" • #{t} {s} {sd} vol={v:.2f} P/L={pl:.5f}")
+        msg = "\n".join(lines)
+        print(msg)
+        send_telegram(msg)
 
 def shutdown_mt5(mt5_module):
     """Cleanly shut down MT5 connection."""
