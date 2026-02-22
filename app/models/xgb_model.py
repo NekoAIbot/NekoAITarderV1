@@ -15,12 +15,13 @@ class MomentumModel(BaseEstimator, ClassifierMixin):
 
     def __init__(
         self,
-        n_estimators=300,
+        n_estimators=400,
         max_depth=6,
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
         random_state=42,
+        scale_pos_weight=1.0,
     ):
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -28,8 +29,8 @@ class MomentumModel(BaseEstimator, ClassifierMixin):
         self.subsample = subsample
         self.colsample_bytree = colsample_bytree
         self.random_state = random_state
+        self.scale_pos_weight = scale_pos_weight
         self.pipeline = None
-
         self._build_pipeline()
 
     def get_model(self):
@@ -46,13 +47,12 @@ class MomentumModel(BaseEstimator, ClassifierMixin):
                 colsample_bytree=self.colsample_bytree,
                 random_state=self.random_state,
                 eval_metric="logloss",
+                scale_pos_weight=self.scale_pos_weight,
+                tree_method="hist"
             )),
         ])
 
     def fit(self, X, y):
-        """
-        Fit XGB on all features automatically, including any multi-window sentiment columns.
-        """
         self._build_pipeline()
         self.pipeline.fit(X, y)
         self.classes_ = np.unique(y)
@@ -64,6 +64,3 @@ class MomentumModel(BaseEstimator, ClassifierMixin):
 
     def predict_proba(self, X):
         return self.pipeline.predict_proba(X)
-
-
-__all__ = ["MomentumModel"]
