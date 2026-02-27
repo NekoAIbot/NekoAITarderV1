@@ -4,6 +4,7 @@
 import sys
 import warnings
 from pathlib import Path
+from multiprocessing import Process
 import numpy as np
 import pandas as pd
 import joblib
@@ -17,254 +18,285 @@ if str(ROOT) not in sys.path:
 from app.market_data import fetch_market_data
 from app.models.xgb_model import MomentumModel
 
-# =========================
-# CONFIGURATION
-# =========================
+# ==========================================
+# CONFIG
+# ==========================================
 
 FX_SYMBOLS = ["EURUSD", "USDJPY", "GBPUSD", "USDCHF", "AUDUSD"]
 CRYPTO_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 
-# ✅ Restrict to 1H only
-TIMEFRAMES = ["1h"]
-
-# ✅ Increase depth for stronger learning
-HISTORY_LIMITS = {
-    "1h": 15000
-}
-
+TIMEFRAME = "1h"
+HISTORY_LIMIT = 15000
 ATR_PERIOD = 14
-FX_COST = 0.0002
-CRYPTO_COST = 0.0005
 
 MODEL_DIR = ROOT / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 
-# =========================
-# FEATURE ENGINEERING
-# =========================
+# ==========================================
+# SAFE SHARPE
+# ==========================================
+
+def compute_sharpe(returns):
+    returns = np.array(returns)
+    if len(returns) < 30:
+        return 0.0
+    std = np.std(returns)
+    if std < 1e-6:
+        return 0.0
+    return np.mean(returns) / std
+
+# ==========================================
+# FEATURES
+# ==========================================
 
 def engineer_features(df):
     df = df.copy()
 
-    # Returns
     df["returns"] = df["close"].pct_change()
-
-    # Trend EMAs
-    df["ema20"] = df["close"].ewm(span=20).mean()
     df["ema50"] = df["close"].ewm(span=50).mean()
-    df["ema100"] = df["close"].ewm(span=100).mean()
     df["ema200"] = df["close"].ewm(span=200).mean()
+    df["ema_slope"] = df["ema50"].pct_change()
 
-    df["ema_trend"] = (df["ema50"] > df["ema200"]).astype(int)
-
-    # RSI
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
     rs = gain.rolling(14).mean() / (loss.rolling(14).mean() + 1e-9)
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # True Range / ATR
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - df["close"].shift()).abs(),
         (df["low"] - df["close"].shift()).abs()
     ], axis=1).max(axis=1)
 
-    df["atr"] = tr.rolling(14).mean()
-
-    # Volatility
+    df["atr"] = tr.rolling(ATR_PERIOD).mean()
     df["volatility20"] = df["returns"].rolling(20).std()
-
-    # Breakout Structure (very important)
-    df["high_50"] = df["high"].rolling(50).max()
-    df["low_50"] = df["low"].rolling(50).min()
-
-    df["breakout_up"] = (df["close"] > df["high_50"].shift()).astype(int)
-    df["breakout_down"] = (df["close"] < df["low_50"].shift()).astype(int)
-
-    # Trend regime
-    df["trend_regime"] = (df["close"] > df["ema200"]).astype(int)
+    df["vol_percentile"] = df["volatility20"].rolling(200).rank(pct=True)
 
     return df.dropna()
 
-# =========================
-# 3-CLASS TARGET
-# =========================
+# ==========================================
+# FX TARGET (Regression)
+# ==========================================
 
-LOOKAHEAD_MAP = {
-    "1h": 6
-}
-
-def create_target(df):
+def create_fx_target(df, lookahead):
     df = df.copy()
-    lookahead = LOOKAHEAD_MAP[df["timeframe"].iloc[0]]
-
-    df["fwd_return"] = df["close"].shift(-lookahead) / df["close"] - 1
-
-    # ✅ Stronger move threshold
-    threshold = 1.75 * df["atr"] / df["close"]
-
-    df["direction"] = 0
-    df.loc[df["fwd_return"] > threshold, "direction"] = 1
-    df.loc[df["fwd_return"] < -threshold, "direction"] = -1
-
-    # Regime = expansion vs contraction
-    df["abs_fwd"] = df["fwd_return"].abs()
-    df["regime_target"] = (
-        df["abs_fwd"] > df["abs_fwd"].rolling(100).median()
-    ).astype(int)
-
+    df["forward_return"] = df["close"].shift(-lookahead) / df["close"] - 1
     return df.dropna()
 
-# =========================
-# LOAD DATA
-# =========================
+# ==========================================
+# CRYPTO TARGET (TP/SL Classification)
+# ==========================================
 
-def load_symbols(symbols, asset_type):
-    frames = []
+def create_crypto_target(df, lookahead, rr_ratio):
+    df = df.copy()
+    df["long_target"] = 0
 
-    for symbol in symbols:
-        for tf in TIMEFRAMES:
+    for i in range(len(df) - lookahead):
+        entry = df["close"].iloc[i]
+        atr = df["atr"].iloc[i]
 
-            print(f"Fetching {symbol} {tf}")
+        sl = entry - atr
+        tp = entry + atr * rr_ratio
 
-            df = fetch_market_data(
-                symbol,
-                timeframe=tf,
-                limit=HISTORY_LIMITS[tf]
-            )
+        future = df.iloc[i+1:i+lookahead+1]
 
-            if df is None or len(df) < 300:
+        for _, row in future.iterrows():
+            if row["low"] <= sl:
+                break
+            if row["high"] >= tp:
+                df.iloc[i, df.columns.get_loc("long_target")] = 1
+                break
+
+    return df
+
+# ==========================================
+# FX TRAINING (Regression Engine)
+# ==========================================
+
+def train_fx():
+
+    print("\n========== TRAINING FX (REGRESSION) ==========\n")
+
+    LOOKAHEAD = 18
+    COST = 0.0002
+    VOL_FILTER = 0.6
+
+    portfolio_returns = []
+
+    for symbol in FX_SYMBOLS:
+
+        print(f"Processing {symbol}")
+
+        df = fetch_market_data(symbol, TIMEFRAME, HISTORY_LIMIT)
+        if df is None or len(df) < 500:
+            continue
+
+        df.index = pd.to_datetime(df.index, utc=True)
+
+        df = engineer_features(df)
+        df = create_fx_target(df, LOOKAHEAD)
+
+        df = df.sort_index()
+
+        split = int(len(df) * 0.7)
+        train = df.iloc[:split]
+        test = df.iloc[split:]
+
+        feature_cols = [c for c in df.columns if c not in ["forward_return"]]
+
+        model = MomentumModel()
+        model.fit(train[feature_cols], train["forward_return"])
+
+        preds = model.predict(test[feature_cols])
+
+        returns = []
+
+        for i, pred in enumerate(preds):
+
+            if test["vol_percentile"].iloc[i] < VOL_FILTER:
                 continue
 
-            df.index = pd.to_datetime(df.index, utc=True)
-            df["symbol"] = symbol
-            df["timeframe"] = tf
-            df["asset_type"] = asset_type
+            position = np.clip(pred * 5, -1, 1)  # scale prediction
 
-            df = engineer_features(df)
-            df = create_target(df)
+            realized = test["forward_return"].iloc[i]
 
-            frames.append(df)
+            r = position * realized - abs(position) * COST
+            returns.append(r)
 
-    return pd.concat(frames).sort_index()
+        sharpe = compute_sharpe(returns)
+        print(f"{symbol} | Sharpe: {round(sharpe,4)} | Trades: {len(returns)}")
 
-# =========================
-# WALK FORWARD
-# =========================
+        portfolio_returns.extend(returns)
 
-# =========================
-# WALK FORWARD
-# =========================
+    portfolio_sharpe = compute_sharpe(portfolio_returns)
 
-def walk_forward(df, cost):
+    print(f"\nFX Portfolio Sharpe: {round(portfolio_sharpe,4)}")
+    print(f"Total Trades: {len(portfolio_returns)}")
 
-    df = df.sort_index()
-    unique_dates = df.index.unique()
-    n_splits = 3
-    split_size = len(unique_dates) // (n_splits + 1)
+    # Train final model on full FX dataset
+    full_data = []
 
-    results = []
+    for symbol in FX_SYMBOLS:
+        df = fetch_market_data(symbol, TIMEFRAME, HISTORY_LIMIT)
+        if df is None or len(df) < 500:
+            continue
+        df.index = pd.to_datetime(df.index, utc=True)
+        df = engineer_features(df)
+        df = create_fx_target(df, LOOKAHEAD)
+        full_data.append(df)
 
-    # Create EMA trend column for direction
-    df["ema_trend"] = (df["ema20"] > df["ema200"]).astype(int)  # 1 = uptrend, 0 = downtrend
+    if full_data:
+        full_df = pd.concat(full_data)
+        feature_cols = [c for c in full_df.columns if c not in ["forward_return"]]
+        final_model = MomentumModel()
+        final_model.fit(full_df[feature_cols], full_df["forward_return"])
+        joblib.dump(final_model, MODEL_DIR / "fx_model.pkl")
+        print("FX model saved.")
 
-    for i in range(n_splits):
+# ==========================================
+# CRYPTO TRAINING (TP Engine)
+# ==========================================
 
-        train_end = split_size * (i + 1)
-        test_end = split_size * (i + 2)
+def train_crypto():
 
-        train = df.loc[unique_dates[:train_end]]
-        test = df.loc[unique_dates[train_end:test_end]]
+    print("\n========== TRAINING CRYPTO (TP/SL) ==========\n")
 
-        feature_cols = [
-            c for c in df.columns
-            if c not in ["symbol", "timeframe", "asset_type",
-                         "direction", "regime_target",
-                         "fwd_return", "abs_fwd", "ema_trend"]
-        ]
+    LOOKAHEAD = 8
+    RR_RATIO = 2.0
+    COST = 0.0005
+    VOL_FILTER = 0.55
 
-        X_train = train[feature_cols]
-        X_test = test[feature_cols]
+    portfolio_returns = []
 
-        y_regime_train = train["regime_target"]
+    for symbol in CRYPTO_SYMBOLS:
 
-        fwd = test["fwd_return"].values
+        print(f"Processing {symbol}")
 
-        # -------------------------
-        # TRAIN ONLY EXPANSION MODEL
-        # -------------------------
-        regime_model = MomentumModel().get_model()
-        regime_model.fit(X_train, y_regime_train)
+        df = fetch_market_data(symbol, TIMEFRAME, HISTORY_LIMIT)
+        if df is None or len(df) < 500:
+            continue
 
-        # Predict expansion probability
-        expansion_prob = regime_model.predict_proba(X_test)[:, 1]
+        df.index = pd.to_datetime(df.index, utc=True)
 
-        # Trade only strong expansion
-        trade_mask = expansion_prob > 0.7
+        df = engineer_features(df)
+        df = create_crypto_target(df, LOOKAHEAD, RR_RATIO)
+        df = df.dropna()
 
-        # Direction from EMA trend
-        ema_trend_test = test["ema_trend"].values
-        direction = np.where(ema_trend_test == 1, 1, -1)
+        df = df.sort_index()
 
-        # Position sizing = expansion confidence
-        position = direction * expansion_prob * trade_mask
+        split = int(len(df) * 0.7)
+        train = df.iloc[:split]
+        test = df.iloc[split:]
 
-        returns = position * fwd - (np.abs(position) > 0) * cost
+        feature_cols = [c for c in df.columns if c not in ["long_target"]]
 
-        sharpe = 0 if len(returns) < 2 else np.mean(returns)/(np.std(returns)+1e-9)
+        model = MomentumModel()
+        model.fit(train[feature_cols], train["long_target"])
 
-        results.append({
-            "fold": i,
-            "sharpe": sharpe,
-            "trades": int(np.sum(np.abs(position) > 0))
-        })
+        preds = model.predict(test[feature_cols])
 
-        print(f"\nFold {i} Sharpe: {round(sharpe,4)} | Trades: {results[-1]['trades']}")
+        returns = []
 
-    return pd.DataFrame(results)
+        for i, pred in enumerate(preds):
 
-# =========================
-# FINAL MODEL TRAINING
-# =========================
+            if pred < 0.55:
+                continue
+
+            if test["vol_percentile"].iloc[i] < VOL_FILTER:
+                continue
+
+            if test["long_target"].iloc[i] == 1:
+                r = RR_RATIO - COST
+            else:
+                r = -1 - COST
+
+            returns.append(r)
+
+        sharpe = compute_sharpe(returns)
+        print(f"{symbol} | Sharpe: {round(sharpe,4)} | Trades: {len(returns)}")
+
+        portfolio_returns.extend(returns)
+
+    portfolio_sharpe = compute_sharpe(portfolio_returns)
+
+    print(f"\nCRYPTO Portfolio Sharpe: {round(portfolio_sharpe,4)}")
+    print(f"Total Trades: {len(portfolio_returns)}")
+
+    # Train final crypto model
+    full_data = []
+
+    for symbol in CRYPTO_SYMBOLS:
+        df = fetch_market_data(symbol, TIMEFRAME, HISTORY_LIMIT)
+        if df is None or len(df) < 500:
+            continue
+        df.index = pd.to_datetime(df.index, utc=True)
+        df = engineer_features(df)
+        df = create_crypto_target(df, LOOKAHEAD, RR_RATIO)
+        df = df.dropna()
+        full_data.append(df)
+
+    if full_data:
+        full_df = pd.concat(full_data)
+        feature_cols = [c for c in full_df.columns if c not in ["long_target"]]
+        final_model = MomentumModel()
+        final_model.fit(full_df[feature_cols], full_df["long_target"])
+        joblib.dump(final_model, MODEL_DIR / "crypto_model.pkl")
+        print("CRYPTO model saved.")
+
+# ==========================================
+# PARALLEL EXECUTION
+# ==========================================
 
 if __name__ == "__main__":
 
-    print("Loading FX data...")
-    fx_df = load_symbols(FX_SYMBOLS, "fx")
+    fx_process = Process(target=train_fx)
+    crypto_process = Process(target=train_crypto)
 
-    print("\nLoading Crypto data...")
-    crypto_df = load_symbols(CRYPTO_SYMBOLS, "crypto")
+    fx_process.start()
+    crypto_process.start()
 
-    print("\nRunning FX Walk-Forward")
-    fx_results = walk_forward(fx_df, FX_COST)
-    print(fx_results)
+    fx_process.join()
+    crypto_process.join()
 
-    print("\nRunning Crypto Walk-Forward")
-    crypto_results = walk_forward(crypto_df, CRYPTO_COST)
-    print(crypto_results)
-
-    print("\nTraining Final FX Expansion Model...")
-    fx_features = [c for c in fx_df.columns if c not in
-        ["symbol","timeframe","asset_type","direction",
-         "regime_target","fwd_return","abs_fwd","ema_trend"]]
-
-    fx_regime = MomentumModel().get_model()
-    fx_regime.fit(fx_df[fx_features],
-                  fx_df["regime_target"])
-
-    joblib.dump(fx_regime, MODEL_DIR/"fx_expansion.pkl")
-
-    print("Training Final Crypto Expansion Model...")
-    crypto_features = [c for c in crypto_df.columns if c not in
-        ["symbol","timeframe","asset_type","direction",
-         "regime_target","fwd_return","abs_fwd","ema_trend"]]
-
-    crypto_regime = MomentumModel().get_model()
-    crypto_regime.fit(crypto_df[crypto_features],
-                      crypto_df["regime_target"])
-
-    joblib.dump(crypto_regime, MODEL_DIR/"crypto_expansion.pkl")
-
-    print("\nAll models trained and saved successfully.")
+    print("\nAll models trained in parallel successfully.")
