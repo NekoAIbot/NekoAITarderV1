@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""Production-grade model training pipeline for NekoAI.
+"""Institutional-style training pipeline with strict data-quality gates.
 
-Highlights:
-- Pulls as much market data as possible via app.market_data fallback chain.
-- Builds robust technical + cross-sectional features.
-- Runs purged walk-forward validation.
-- Tunes and compares strong baseline models.
-- Persists a self-contained model bundle with metadata.
+Key design goals:
+- NEVER train on synthetic fallback candles.
+- Fetch richest available data from multiple providers with strict provenance.
+- Validate data quality before modeling.
+- Tune models with walk-forward CV and trading-oriented objective.
+- Persist reproducible bundle with metadata and thresholds.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import math
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
 import joblib
 import numpy as np
@@ -26,7 +28,7 @@ from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
@@ -36,71 +38,101 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config import CRYPTO_ASSETS, FOREX_MAJORS
-import importlib.util
 
 
-def _load_fetch_market_data():
+# -------------------------
+# Dynamic import of market_data without importing app package side-effects
+# -------------------------
+def _load_market_module():
     module_path = ROOT / "app" / "market_data.py"
     spec = importlib.util.spec_from_file_location("neko_market_data", module_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Unable to load market_data module from {module_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.fetch_market_data
+    return module
 
 
-fetch_market_data = _load_fetch_market_data()
+MARKET = _load_market_module()
 
 
-MODEL_DIR = ROOT / "models"
-PROD_DIR = MODEL_DIR / "production"
+MODEL_DIR = ROOT / "models" / "production"
 
 
 @dataclass
-class Config:
+class TrainConfig:
     timeframe: str
     limit: int
     horizon: int
     min_rows_per_symbol: int
-    train_fraction: float
+    min_symbols: int
     n_splits: int
     embargo: int
+    train_fraction: float
+    random_state: int
 
 
-def _utc_now() -> str:
+def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _safe_symbol_data(symbol: str, timeframe: str, limit: int) -> pd.DataFrame | None:
-    try:
-        df = fetch_market_data(symbol, timeframe=timeframe, limit=limit)
-    except Exception as exc:
-        print(f"[WARN] fetch failed for {symbol}: {exc}")
-        return None
-
-    if df is None or df.empty:
-        print(f"[WARN] no rows for {symbol}")
-        return None
-
-    required = {"open", "high", "low", "close", "volume"}
-    if not required.issubset(df.columns):
-        print(f"[WARN] missing columns for {symbol}: {sorted(required - set(df.columns))}")
-        return None
-
-    out = df.copy()
+def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    required = ["open", "high", "low", "close", "volume"]
+    if not set(required).issubset(df.columns):
+        raise ValueError(f"Missing OHLCV columns, got: {list(df.columns)}")
+    out = df[required].copy()
     out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
-    out = out.dropna(subset=["open", "high", "low", "close", "volume"])
+    out = out.dropna()
     out = out[~out.index.duplicated(keep="last")].sort_index()
     return out
+
+
+def _candle_quality_checks(df: pd.DataFrame, symbol: str, min_rows: int) -> None:
+    if len(df) < min_rows:
+        raise ValueError(f"{symbol}: insufficient rows ({len(df)} < {min_rows})")
+
+    if (df["close"] <= 0).any() or (df[["open", "high", "low"]] <= 0).any().any():
+        raise ValueError(f"{symbol}: non-positive prices detected")
+
+    if (df["high"] < df["low"]).any():
+        raise ValueError(f"{symbol}: high<low anomaly")
+
+    flat_ratio = float((df["close"].diff().abs() < 1e-12).mean())
+    if flat_ratio > 0.98:
+        raise ValueError(f"{symbol}: suspiciously flat series ({flat_ratio:.3f})")
+
+    nan_ratio = float(df.isna().mean().mean())
+    if nan_ratio > 0.01:
+        raise ValueError(f"{symbol}: too many NaN values ({nan_ratio:.4f})")
+
+
+def _provider_attempts(symbol: str, timeframe: str, limit: int) -> Iterable[Tuple[str, Any]]:
+    # Intentionally avoid MARKET.fetch_market_data because it can synthesize random fallback candles.
+    yield "yfinance", lambda: MARKET.fetch_yfinance(symbol, timeframe, limit)
+    yield "twelvedata", lambda: MARKET.fetch_twelvedata(symbol, timeframe, limit)
+    yield "alphavantage", lambda: MARKET.fetch_alphavantage(symbol, timeframe, limit)
+
+
+def fetch_real_data(symbol: str, timeframe: str, limit: int, min_rows: int) -> Tuple[pd.DataFrame, str]:
+    errors: List[str] = []
+    for provider, fn in _provider_attempts(symbol, timeframe, limit):
+        try:
+            df = _ensure_ohlcv(fn())
+            _candle_quality_checks(df, symbol, min_rows)
+            return df, provider
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{provider}: {exc}")
+
+    raise RuntimeError(f"{symbol}: all providers failed quality checks -> {' | '.join(errors)}")
 
 
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
-    roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
-    rs = roll_up / roll_down.replace(0, np.nan)
+    ru = up.ewm(alpha=1 / period, adjust=False).mean()
+    rd = down.ewm(alpha=1 / period, adjust=False).mean()
+    rs = ru / rd.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
 
@@ -117,117 +149,124 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 
-def _build_symbol_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
-
     x["ret_1"] = x["close"].pct_change(1)
     x["ret_3"] = x["close"].pct_change(3)
-    x["ret_5"] = x["close"].pct_change(5)
-    x["ret_15"] = x["close"].pct_change(15)
+    x["ret_6"] = x["close"].pct_change(6)
+    x["ret_12"] = x["close"].pct_change(12)
 
     x["log_ret_1"] = np.log(x["close"]).diff(1)
-    x["range"] = (x["high"] - x["low"]) / x["close"].replace(0, np.nan)
+    x["log_ret_3"] = np.log(x["close"]).diff(3)
 
     x["ema_8"] = x["close"].ewm(span=8, adjust=False).mean()
     x["ema_21"] = x["close"].ewm(span=21, adjust=False).mean()
     x["ema_55"] = x["close"].ewm(span=55, adjust=False).mean()
-    x["ema_diff_8_21"] = (x["ema_8"] - x["ema_21"]) / x["close"].replace(0, np.nan)
-    x["ema_diff_21_55"] = (x["ema_21"] - x["ema_55"]) / x["close"].replace(0, np.nan)
+    x["ema_spread_8_21"] = (x["ema_8"] - x["ema_21"]) / x["close"].replace(0, np.nan)
+    x["ema_spread_21_55"] = (x["ema_21"] - x["ema_55"]) / x["close"].replace(0, np.nan)
 
     x["rsi_14"] = _rsi(x["close"], 14)
     x["atr_14"] = _atr(x, 14)
     x["atr_pct"] = x["atr_14"] / x["close"].replace(0, np.nan)
+    x["hl_range"] = (x["high"] - x["low"]) / x["close"].replace(0, np.nan)
 
-    vol_sma_20 = x["volume"].rolling(20).mean()
-    vol_std_20 = x["volume"].rolling(20).std()
-    x["vol_z_20"] = (x["volume"] - vol_sma_20) / vol_std_20.replace(0, np.nan)
+    vma20 = x["volume"].rolling(20).mean()
+    vstd20 = x["volume"].rolling(20).std()
+    x["vol_z20"] = (x["volume"] - vma20) / vstd20.replace(0, np.nan)
 
-    mom_10 = x["close"] - x["close"].shift(10)
-    x["mom_10"] = mom_10 / x["close"].shift(10).replace(0, np.nan)
+    mom10 = x["close"] - x["close"].shift(10)
+    x["mom_10"] = mom10 / x["close"].shift(10).replace(0, np.nan)
 
     return x
 
 
-def _build_panel_dataset(symbols: List[str], cfg: Config) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    rows = []
-    coverage = {}
+def assemble_panel(cfg: TrainConfig, symbols: List[str]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    rows: List[pd.DataFrame] = []
+    provenance: Dict[str, str] = {}
+    coverage: Dict[str, int] = {}
 
     for sym in symbols:
-        raw = _safe_symbol_data(sym, cfg.timeframe, cfg.limit)
-        if raw is None or len(raw) < cfg.min_rows_per_symbol:
-            print(f"[WARN] skip {sym}: insufficient rows")
+        try:
+            raw, provider = fetch_real_data(sym, cfg.timeframe, cfg.limit, cfg.min_rows_per_symbol)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] {sym}: {exc}")
             continue
 
-        feat = _build_symbol_features(raw)
-        feat["symbol"] = sym
-
+        feat = build_features(raw)
         fwd = feat["close"].shift(-cfg.horizon) / feat["close"] - 1
-        fwd = fwd.clip(-0.20, 0.20)
-        feat["target_return"] = fwd
-        feat["target"] = (fwd > 0).astype(int)
+        feat["target_return"] = fwd.clip(-0.05, 0.05)
+        feat["target"] = (feat["target_return"] > 0).astype(int)
+        feat["symbol"] = sym
+        feat = feat.replace([np.inf, -np.inf], np.nan).dropna()
 
-        feat = feat.dropna()
         if len(feat) < cfg.min_rows_per_symbol // 2:
-            print(f"[WARN] skip {sym}: too few rows after featureing")
+            print(f"[WARN] {sym}: too few rows after feature build ({len(feat)})")
             continue
 
-        coverage[sym] = len(feat)
+        provenance[sym] = provider
+        coverage[sym] = int(len(feat))
         rows.append(feat)
 
-    if not rows:
-        raise RuntimeError("No usable data assembled. Check API keys/network/data availability.")
+    if len(rows) < cfg.min_symbols:
+        raise RuntimeError(
+            f"Insufficient high-quality symbols ({len(rows)} < {cfg.min_symbols}). "
+            "Refusing to train to protect model quality."
+        )
 
     panel = pd.concat(rows).sort_index()
 
-    symbol_ret = panel.pivot_table(index=panel.index, columns="symbol", values="ret_1")
-    panel["cross_mkt_ret_mean"] = symbol_ret.mean(axis=1).reindex(panel.index).fillna(0.0).values
-    panel["cross_mkt_ret_std"] = symbol_ret.std(axis=1).reindex(panel.index).fillna(0.0).values
+    pivot_ret1 = panel.pivot_table(index=panel.index, columns="symbol", values="ret_1")
+    panel["cross_ret_mean"] = pivot_ret1.mean(axis=1).reindex(panel.index).fillna(0.0).values
+    panel["cross_ret_std"] = pivot_ret1.std(axis=1).reindex(panel.index).fillna(0.0).values
 
     panel = panel.replace([np.inf, -np.inf], np.nan).dropna(subset=["target", "target_return"])
-    return panel, coverage
+
+    meta = {
+        "provenance": provenance,
+        "coverage_rows": coverage,
+        "rows_total": int(len(panel)),
+        "symbols_used": sorted(list(coverage.keys())),
+    }
+    return panel, meta
 
 
-def _feature_columns(df: pd.DataFrame) -> List[str]:
+def feature_columns(df: pd.DataFrame) -> List[str]:
     excluded = {"target", "target_return", "symbol"}
     return [c for c in df.columns if c not in excluded]
 
 
-def _time_walk_forward_splits(index: pd.DatetimeIndex, n_splits: int, train_fraction: float, embargo: int):
-    unique_ts = np.array(sorted(index.unique()))
-    n = len(unique_ts)
-    if n < 60:
-        print(f"[WARN] limited unique timestamps for walk-forward: {n}")
+def walk_forward_splits(index: pd.DatetimeIndex, n_splits: int, train_fraction: float, embargo: int):
+    ts = np.array(sorted(index.unique()))
+    n = len(ts)
+    if n < 120:
+        raise RuntimeError("Too few unique timestamps for robust walk-forward CV")
 
-    train_size = int(n * train_fraction)
-    train_size = max(train_size, min(40, max(n - 20, 1)))
+    train_size = max(int(n * train_fraction), 80)
+    test_size = max((n - train_size) // max(n_splits, 1), 20)
 
-    test_size = max((n - train_size) // max(n_splits, 1), 10)
-
-    for k in range(n_splits):
-        train_end = train_size + k * test_size
+    for i in range(n_splits):
+        train_end = train_size + i * test_size
         test_start = min(train_end + embargo, n - 1)
         test_end = min(test_start + test_size, n)
         if test_end - test_start < 10:
             continue
-        train_ts = unique_ts[:train_end]
-        test_ts = unique_ts[test_start:test_end]
-        yield train_ts, test_ts
+        yield set(ts[:train_end]), set(ts[test_start:test_end])
 
 
-def _build_candidates(seed: int) -> Dict[str, Pipeline]:
+def build_candidates(seed: int) -> Dict[str, Pipeline]:
     return {
-        "xgb_balanced": Pipeline(
+        "xgb": Pipeline(
             [
                 ("imputer", SimpleImputer(strategy="median")),
                 (
                     "model",
                     XGBClassifier(
-                        n_estimators=700,
+                        n_estimators=900,
                         max_depth=6,
-                        learning_rate=0.03,
+                        learning_rate=0.025,
                         subsample=0.9,
-                        colsample_bytree=0.8,
-                        reg_lambda=1.0,
+                        colsample_bytree=0.85,
+                        reg_lambda=1.2,
                         min_child_weight=2,
                         random_state=seed,
                         n_jobs=-1,
@@ -236,15 +275,15 @@ def _build_candidates(seed: int) -> Dict[str, Pipeline]:
                 ),
             ]
         ),
-        "rf_robust": Pipeline(
+        "rf": Pipeline(
             [
                 ("imputer", SimpleImputer(strategy="median")),
                 (
                     "model",
                     RandomForestClassifier(
-                        n_estimators=600,
+                        n_estimators=900,
                         max_depth=10,
-                        min_samples_leaf=2,
+                        min_samples_leaf=3,
                         class_weight="balanced_subsample",
                         random_state=seed,
                         n_jobs=-1,
@@ -252,17 +291,17 @@ def _build_candidates(seed: int) -> Dict[str, Pipeline]:
                 ),
             ]
         ),
-        "logreg_calibrated": Pipeline(
+        "logreg": Pipeline(
             [
                 ("imputer", SimpleImputer(strategy="median")),
                 ("scaler", StandardScaler()),
                 (
                     "model",
                     LogisticRegression(
-                        C=0.8,
+                        C=0.7,
                         class_weight="balanced",
                         random_state=seed,
-                        max_iter=400,
+                        max_iter=500,
                         n_jobs=-1,
                     ),
                 ),
@@ -271,137 +310,150 @@ def _build_candidates(seed: int) -> Dict[str, Pipeline]:
     }
 
 
-def _score_fold(y_true: np.ndarray, proba: np.ndarray, threshold: float = 0.52) -> Dict[str, float]:
+def trading_objective(y_true: np.ndarray, proba: np.ndarray, threshold: float, cost_bps: float) -> Dict[str, float]:
     pred = (proba >= threshold).astype(int)
-    pnl = np.where(pred == 1, np.where(y_true == 1, 1.0, -1.0), 0.0)
+    costs = cost_bps / 10000.0
+
+    pnl = np.where(pred == 1, np.where(y_true == 1, 1.0 - costs, -1.0 - costs), 0.0)
+    trade_count = int(np.sum(pred == 1))
+    win_rate = float(np.mean(pnl[pred == 1] > 0)) if trade_count else 0.0
 
     auc = 0.5
     if len(np.unique(y_true)) > 1:
-        auc = roc_auc_score(y_true, proba)
+        auc = float(roc_auc_score(y_true, proba))
+
+    mean_pnl = float(np.mean(pnl))
+    sharpe = float(mean_pnl / (np.std(pnl) + 1e-9))
+
+    # conservative combined objective
+    score = (0.55 * sharpe) + (0.35 * auc) + (0.10 * (win_rate - 0.5))
 
     return {
-        "accuracy": float(accuracy_score(y_true, pred)),
-        "precision": float(precision_score(y_true, pred, zero_division=0)),
-        "recall": float(recall_score(y_true, pred, zero_division=0)),
-        "f1": float(f1_score(y_true, pred, zero_division=0)),
-        "auc": float(auc),
-        "pnl_mean": float(np.mean(pnl)),
-        "pnl_sharpe": float(np.mean(pnl) / (np.std(pnl) + 1e-9)),
-        "trades": int(np.sum(pred == 1)),
+        "score": score,
+        "auc": auc,
+        "sharpe": sharpe,
+        "mean_pnl": mean_pnl,
+        "trade_count": float(trade_count),
+        "win_rate": win_rate,
     }
 
 
-def train(cfg: Config, seed: int, symbols: List[str]) -> Path:
-    panel, coverage = _build_panel_dataset(symbols, cfg)
-    if panel.empty:
-        raise RuntimeError("Assembled panel dataset is empty after preprocessing.")
+def threshold_search(y_true: np.ndarray, proba: np.ndarray, cost_bps: float) -> Tuple[float, Dict[str, float]]:
+    candidates = np.arange(0.52, 0.71, 0.01)
+    best_t, best_m = 0.55, None
+    for t in candidates:
+        m = trading_objective(y_true, proba, float(t), cost_bps)
+        if best_m is None or m["score"] > best_m["score"]:
+            best_t, best_m = float(t), m
+    assert best_m is not None
+    return best_t, best_m
 
-    feats = _feature_columns(panel)
 
-    candidates = _build_candidates(seed)
-    cv_results = {name: [] for name in candidates}
+def train(cfg: TrainConfig, symbols: List[str], cost_bps: float) -> Path:
+    panel, data_meta = assemble_panel(cfg, symbols)
+    feats = feature_columns(panel)
 
-    idx = panel.index
+    candidates = build_candidates(cfg.random_state)
+    folds_by_model: Dict[str, List[Dict[str, float]]] = {k: [] for k in candidates}
+
     for fold, (train_ts, test_ts) in enumerate(
-        _time_walk_forward_splits(idx, cfg.n_splits, cfg.train_fraction, cfg.embargo),
+        walk_forward_splits(panel.index, cfg.n_splits, cfg.train_fraction, cfg.embargo),
         start=1,
     ):
-        tr = panel[panel.index.isin(train_ts)]
-        te = panel[panel.index.isin(test_ts)]
-
-        x_tr, y_tr = tr[feats], tr["target"].astype(int)
-        x_te, y_te = te[feats], te["target"].astype(int)
-
-        for name, model in candidates.items():
-            m = clone(model)
-            m.fit(x_tr, y_tr)
-            proba = m.predict_proba(x_te)[:, 1]
-            metrics = _score_fold(y_te.to_numpy(), proba)
-            cv_results[name].append(metrics)
-            print(f"[fold={fold}] {name}: f1={metrics['f1']:.4f} auc={metrics['auc']:.4f} sharpe={metrics['pnl_sharpe']:.4f}")
-
-    summary = {}
-    for name, folds in cv_results.items():
-        if not folds:
-            continue
-        summary[name] = {
-            k: float(np.mean([f[k] for f in folds])) for k in folds[0].keys()
-        }
-
-    if not summary:
-        print("[WARN] no walk-forward folds produced; falling back to single holdout split.")
-        unique_ts = np.array(sorted(panel.index.unique()))
-        split = max(int(len(unique_ts) * cfg.train_fraction), 1)
-        train_ts = set(unique_ts[:split])
-        test_ts = set(unique_ts[split:]) if split < len(unique_ts) else set(unique_ts[-1:])
         tr = panel[panel.index.map(lambda x: x in train_ts)]
         te = panel[panel.index.map(lambda x: x in test_ts)]
-        x_tr, y_tr = tr[feats], tr["target"].astype(int)
-        x_te, y_te = te[feats], te["target"].astype(int)
+        x_tr, y_tr = tr[feats], tr["target"].astype(int).to_numpy()
+        x_te, y_te = te[feats], te["target"].astype(int).to_numpy()
+
         for name, model in candidates.items():
             m = clone(model)
             m.fit(x_tr, y_tr)
-            proba = m.predict_proba(x_te)[:, 1]
-            metrics = _score_fold(y_te.to_numpy(), proba)
-            summary[name] = metrics
+            p = m.predict_proba(x_te)[:, 1]
+            thr, metrics = threshold_search(y_te, p, cost_bps)
+            metrics["threshold"] = thr
+            folds_by_model[name].append(metrics)
+            print(
+                f"[fold={fold}] {name}: score={metrics['score']:.4f} "
+                f"auc={metrics['auc']:.4f} sharpe={metrics['sharpe']:.4f} "
+                f"thr={thr:.2f}"
+            )
 
-    best_name = max(summary, key=lambda n: (summary[n]["pnl_sharpe"], summary[n]["f1"], summary[n]["auc"]))
-    print(f"[INFO] best model: {best_name} | {summary[best_name]}")
+    summary: Dict[str, Dict[str, float]] = {}
+    for name, fold_metrics in folds_by_model.items():
+        if not fold_metrics:
+            continue
+        keys = fold_metrics[0].keys()
+        summary[name] = {k: float(np.mean([m[k] for m in fold_metrics])) for k in keys}
+
+    if not summary:
+        raise RuntimeError("No valid folds completed. Increase data quality/size.")
+
+    best_name = max(summary, key=lambda n: summary[n]["score"])
+    best_threshold = summary[best_name]["threshold"]
+    print(f"[INFO] selected model={best_name} threshold={best_threshold:.2f}")
 
     best_model = clone(candidates[best_name])
-    best_model.fit(panel[feats], panel["target"].astype(int))
+    best_model.fit(panel[feats], panel["target"].astype(int).to_numpy())
 
-    PROD_DIR.mkdir(parents=True, exist_ok=True)
-    out_file = PROD_DIR / "best_production_bundle.joblib"
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    bundle_path = MODEL_DIR / "best_production_bundle.joblib"
 
     bundle = {
-        "created_at_utc": _utc_now(),
+        "created_at_utc": utc_now(),
         "config": cfg.__dict__,
-        "symbols": symbols,
-        "coverage_rows": coverage,
+        "symbols": data_meta["symbols_used"],
         "feature_columns": feats,
+        "provenance": data_meta["provenance"],
+        "coverage_rows": data_meta["coverage_rows"],
+        "rows_total": data_meta["rows_total"],
+        "selection_cost_bps": cost_bps,
         "best_model_name": best_name,
+        "best_threshold": best_threshold,
         "cv_summary": summary,
         "model": best_model,
     }
 
-    joblib.dump(bundle, out_file)
+    joblib.dump(bundle, bundle_path)
 
-    meta_file = PROD_DIR / "best_production_bundle.meta.json"
-    meta_file.write_text(json.dumps({k: v for k, v in bundle.items() if k != "model"}, indent=2))
+    meta_path = MODEL_DIR / "best_production_bundle.meta.json"
+    meta_path.write_text(json.dumps({k: v for k, v in bundle.items() if k != "model"}, indent=2))
 
-    print(f"[OK] model bundle written: {out_file}")
-    print(f"[OK] metadata written: {meta_file}")
-    return out_file
+    print(f"[OK] bundle: {bundle_path}")
+    print(f"[OK] metadata: {meta_path}")
+    return bundle_path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train production-grade classifier using richest available market data.")
-    parser.add_argument("--timeframe", default="5m", help="Data timeframe, e.g. 1m/5m/15m/1h")
-    parser.add_argument("--limit", type=int, default=20000, help="Max bars requested per symbol")
-    parser.add_argument("--horizon", type=int, default=3, help="Bars ahead for target")
-    parser.add_argument("--min-rows", type=int, default=1200, help="Min rows per symbol")
-    parser.add_argument("--train-fraction", type=float, default=0.7, help="Initial train fraction")
-    parser.add_argument("--splits", type=int, default=5, help="Walk-forward splits")
-    parser.add_argument("--embargo", type=int, default=2, help="Embargo bars between train/test")
-    parser.add_argument("--seed", type=int, default=42)
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Strict production training pipeline (real data only).")
+    p.add_argument("--timeframe", default="5m")
+    p.add_argument("--limit", type=int, default=10000)
+    p.add_argument("--horizon", type=int, default=3)
+    p.add_argument("--min-rows", type=int, default=1200)
+    p.add_argument("--min-symbols", type=int, default=8)
+    p.add_argument("--splits", type=int, default=5)
+    p.add_argument("--embargo", type=int, default=2)
+    p.add_argument("--train-fraction", type=float, default=0.7)
+    p.add_argument("--cost-bps", type=float, default=3.5)
+    p.add_argument("--seed", type=int, default=42)
+    return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    cfg = Config(
+    cfg = TrainConfig(
         timeframe=args.timeframe,
         limit=args.limit,
         horizon=args.horizon,
         min_rows_per_symbol=args.min_rows,
-        train_fraction=args.train_fraction,
+        min_symbols=args.min_symbols,
         n_splits=args.splits,
         embargo=args.embargo,
+        train_fraction=args.train_fraction,
+        random_state=args.seed,
     )
 
     symbols = FOREX_MAJORS + CRYPTO_ASSETS
-    train(cfg, seed=args.seed, symbols=symbols)
+    train(cfg, symbols, cost_bps=args.cost_bps)
 
 
 if __name__ == "__main__":
