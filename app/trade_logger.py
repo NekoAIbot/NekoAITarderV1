@@ -3,6 +3,7 @@
 import csv
 from pathlib import Path
 from datetime import datetime
+from app.db import insert_trade
 
 # will live next to this file
 LOG_FILE = Path(__file__).parent / "trades.csv"
@@ -47,3 +48,4 @@ def log_trade(
             profit,
             int(win),
         ])
+    insert_trade(timestamp, symbol, signal, volume, entry_price, exit_price, profit, win)

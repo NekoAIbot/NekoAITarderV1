@@ -3,9 +3,10 @@ import numpy as np
 import random
 import time
 import os
+import logging
 from datetime import datetime
 
-from config import get_today_symbols, SL_AMOUNT, TP_AMOUNT, USE_MOCK_MT5, MIN_CONFIDENCE_PCT, MAX_DAILY_LOSS
+from config import get_today_symbols, SL_AMOUNT, TP_AMOUNT, USE_MOCK_MT5, MIN_CONFIDENCE_PCT
 from app.market_data import fetch_market_data
 from app.mt5_handler import initialize_mt5, shutdown_mt5, open_trade, close_trade
 from app.models.ai_model import MomentumModel as BasicModel
@@ -14,19 +15,24 @@ from app.telegram_bot import send_message, send_message_channel
 from app.state import increment_trade_count, get_bot_status
 from app.risk_manager import RiskManager
 from app.id_manager import IDManager
+from app.db import insert_order
+from app.risk_engine import RiskEngine
 
 MOCK_TRADE_HOLD_SECONDS = int(os.getenv("MOCK_TRADE_HOLD_SECONDS", 120))
 PRE_SIGNAL_WAIT        = 30  # seconds
 
+logger = logging.getLogger(__name__)
+
 def trading_job():
     """Main trading execution: pre-signal, AI signal, execute trades."""
     symbols = get_today_symbols()
-    print(f"[{datetime.utcnow()}] Trading cycle: {symbols}")
+    logger.info(f"Trading cycle started | symbols={symbols}")
 
     mt5   = initialize_mt5()
     model = BasicModel()
     rm    = RiskManager()
     idm   = IDManager()
+    risk  = RiskEngine()
 
     for sym in symbols:
         # 1) Pre-signal alert
@@ -52,16 +58,19 @@ def trading_job():
 
         # risk guardrails
         if conf < MIN_CONFIDENCE_PCT:
-            print(f"ℹ️ Skipping {sym}: confidence {conf:.1f}% < {MIN_CONFIDENCE_PCT:.1f}%")
+            logger.info(f"Skipping {sym}: confidence {conf:.1f}% < {MIN_CONFIDENCE_PCT:.1f}%")
             continue
 
         _, _, _, _, _, pnl = get_bot_status()
-        if pnl <= -abs(MAX_DAILY_LOSS):
-            msg = f"🛑 Daily loss limit reached ({pnl:.5f}). Halting trading cycle."
-            print(msg)
+        allowed, reason = risk.can_open(sym, pnl)
+        if not allowed:
+            msg = f"🛑 Risk engine blocked {sym}: {reason} (pnl={pnl:.5f})"
+            logger.warning(msg)
             send_message(msg)
             send_message_channel(msg)
-            break
+            if reason == "daily_loss_limit":
+                break
+            continue
 
         sid = idm.next()
 
@@ -114,14 +123,20 @@ def trading_job():
 
         # 7) Execute trade
         volume = rm.get_lot()
+        insert_order(datetime.utcnow().isoformat(), sym, sig, volume, "submitted")
+        risk.on_open(sym)
         res    = open_trade(mt5, sym, sig, volume)
         if not res or (hasattr(res, "retcode") and res.retcode != 0):
+            insert_order(datetime.utcnow().isoformat(), sym, sig, volume, "failed")
+            risk.on_close(sym)
             continue
         ticket = getattr(res, "order", None)
+        insert_order(datetime.utcnow().isoformat(), sym, sig, volume, "filled", str(ticket or ""))
 
         # 8) Hold then close
         time.sleep(MOCK_TRADE_HOLD_SECONDS)
         close_trade(mt5, ticket, sym)
+        risk.on_close(sym)
 
         # 9) Profit & stats
         profit = 0.0
@@ -137,6 +152,6 @@ def trading_job():
         win = profit > 0
         increment_trade_count(sym, win=win, profit=profit)
         rm.adjust(win)
-        print(f"🏁 {sym} {'WIN' if win else 'LOSS'} ({profit:.5f})")
+        logger.info(f"{sym} {'WIN' if win else 'LOSS'} ({profit:.5f})")
 
     shutdown_mt5(mt5)

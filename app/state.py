@@ -1,11 +1,21 @@
 # app/state.py
 import time
 from collections import defaultdict
+from app.db import get_state, set_state
 
 start_time = time.time()
-trades_today = wins_today = losses_today = 0
-daily_pnl = 0.0
+trades_today = int(get_state("trades_today", "0"))
+wins_today = int(get_state("wins_today", "0"))
+losses_today = int(get_state("losses_today", "0"))
+daily_pnl = float(get_state("daily_pnl", "0.0"))
 symbol_trade_counter = defaultdict(int)
+
+
+def _persist() -> None:
+    set_state("trades_today", str(trades_today))
+    set_state("wins_today", str(wins_today))
+    set_state("losses_today", str(losses_today))
+    set_state("daily_pnl", str(daily_pnl))
 
 
 def increment_trade_count(symbol=None, win=None, profit: float = 0.0):
@@ -18,6 +28,7 @@ def increment_trade_count(symbol=None, win=None, profit: float = 0.0):
         wins_today += 1
     elif win is False:
         losses_today += 1
+    _persist()
 
 
 def get_bot_status():
@@ -51,4 +62,5 @@ def reset_daily_trades():
     trades_today = wins_today = losses_today = 0
     daily_pnl = 0.0
     symbol_trade_counter = defaultdict(int)
+    _persist()
     print("✅ Daily stats reset")
