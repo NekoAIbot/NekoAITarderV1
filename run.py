@@ -8,10 +8,6 @@ load_dotenv()  # MUST be first – before any app imports
 
 import os
 
-# Optional one-time debug (remove after verification)
-print("BOT =", os.getenv("TELEGRAM_BOT_TOKEN"))
-print("CHAT =", os.getenv("TELEGRAM_CHAT_ID"))
-
 # =========================
 # NOW import app modules
 # =========================

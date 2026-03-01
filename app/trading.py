@@ -5,13 +5,13 @@ import time
 import os
 from datetime import datetime
 
-from config import get_today_symbols, SL_AMOUNT, TP_AMOUNT, USE_MOCK_MT5
+from config import get_today_symbols, SL_AMOUNT, TP_AMOUNT, USE_MOCK_MT5, MIN_CONFIDENCE_PCT, MAX_DAILY_LOSS
 from app.market_data import fetch_market_data
 from app.mt5_handler import initialize_mt5, shutdown_mt5, open_trade, close_trade
 from app.models.ai_model import MomentumModel as BasicModel
 from app.news import get_news_sentiment
 from app.telegram_bot import send_message, send_message_channel
-from app.state import increment_trade_count
+from app.state import increment_trade_count, get_bot_status
 from app.risk_manager import RiskManager
 from app.id_manager import IDManager
 
@@ -49,6 +49,19 @@ def trading_job():
         sig  = out.get("signal", "HOLD").upper()
         conf = out.get("confidence", 0.0)
         pc   = out.get("predicted_change", 0.0)
+
+        # risk guardrails
+        if conf < MIN_CONFIDENCE_PCT:
+            print(f"ℹ️ Skipping {sym}: confidence {conf:.1f}% < {MIN_CONFIDENCE_PCT:.1f}%")
+            continue
+
+        _, _, _, _, _, pnl = get_bot_status()
+        if pnl <= -abs(MAX_DAILY_LOSS):
+            msg = f"🛑 Daily loss limit reached ({pnl:.5f}). Halting trading cycle."
+            print(msg)
+            send_message(msg)
+            send_message_channel(msg)
+            break
 
         sid = idm.next()
 
@@ -122,7 +135,7 @@ def trading_job():
             profit = random.choice([TP_AMOUNT * pip, -SL_AMOUNT * pip])
 
         win = profit > 0
-        increment_trade_count(sym, win=win)
+        increment_trade_count(sym, win=win, profit=profit)
         rm.adjust(win)
         print(f"🏁 {sym} {'WIN' if win else 'LOSS'} ({profit:.5f})")
 
