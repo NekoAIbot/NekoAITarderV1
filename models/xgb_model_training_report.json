@@ -1,0 +1,70 @@
+{
+  "trained_at": "2026-03-01T14:19:30.883270+00:00",
+  "rows": 152544,
+  "train_rows": 122035,
+  "test_rows": 30509,
+  "best_params": {
+    "n_estimators": 350,
+    "max_depth": 4,
+    "learning_rate": 0.06,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8
+  },
+  "best_metrics": {
+    "accuracy": 0.7428955390212724,
+    "f1": 0.7393500365521366,
+    "roc_auc": 0.8220283609770547
+  },
+  "best_score": 0.7806891987645956,
+  "all_results": [
+    {
+      "params": {
+        "n_estimators": 400,
+        "max_depth": 5,
+        "learning_rate": 0.04,
+        "subsample": 0.9,
+        "colsample_bytree": 0.9
+      },
+      "metrics": {
+        "accuracy": 0.7423383263954898,
+        "f1": 0.739105904218247,
+        "roc_auc": 0.8220668765558361
+      },
+      "score": 0.7805863903870416
+    },
+    {
+      "params": {
+        "n_estimators": 500,
+        "max_depth": 6,
+        "learning_rate": 0.03,
+        "subsample": 0.85,
+        "colsample_bytree": 0.85
+      },
+      "metrics": {
+        "accuracy": 0.7426660985283031,
+        "f1": 0.7396624332659084,
+        "roc_auc": 0.8215422417295053
+      },
+      "score": 0.7806023374977069
+    },
+    {
+      "params": {
+        "n_estimators": 350,
+        "max_depth": 4,
+        "learning_rate": 0.06,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8
+      },
+      "metrics": {
+        "accuracy": 0.7428955390212724,
+        "f1": 0.7393500365521366,
+        "roc_auc": 0.8220283609770547
+      },
+      "score": 0.7806891987645956
+    }
+  ],
+  "artifacts": {
+    "runtime": "/workspace/NekoAITarderV1/app/models/models/xgb_model.joblib",
+    "backup": "/workspace/NekoAITarderV1/models/xgb_model_production.joblib"
+  }
+}

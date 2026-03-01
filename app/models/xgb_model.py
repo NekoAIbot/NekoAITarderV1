@@ -38,3 +38,8 @@ class MomentumModel(BaseEstimator, RegressorMixin):
     def load(self, path):
         self.model = joblib.load(path)
         return self
+
+# Backward-compatible alias used by older scripts
+XGBModel = MomentumModel
+
+__all__ = ["MomentumModel", "XGBModel"]
