@@ -1,7 +1,15 @@
 .env
+.venv/
 venv/
 __pycache__/
 *.pyc
-.venv/"__pycache__/" 
-"*.pyc"      
-.venv/
+
+# model/binary artifacts
+*.joblib
+*.pkl
+*.h5
+*.keras
+*.db
+
+# local runtime artifacts
+app/nekoai.db

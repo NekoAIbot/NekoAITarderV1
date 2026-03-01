@@ -16,3 +16,4 @@ gym
 feedparser
 yfinance
 transformers
+vaderSentiment
