@@ -9,7 +9,7 @@ from app.telegram_bot       import send_message, send_message_channel
 from app.state              import get_bot_status, reset_daily_trades, daily_summary
 
 def heartbeat_job():
-    up, total_trades, top_syms, wins, losses = get_bot_status()
+    up, total_trades, top_syms, wins, losses, pnl = get_bot_status()
     lines = [
         "💓 All systems go.",
         "🛰️ Tracking markets.",
@@ -18,6 +18,7 @@ def heartbeat_job():
     msg = random.choice(lines) + "\n"
     msg += f"⏱ Uptime: {up}\n"
     msg += f"📊 Trades: {total_trades}  ✅{wins}  ❌{losses}\n"
+    msg += f"💰 Daily P/L: {pnl:.5f}\n"
     msg += f"🏆 Top Symbols: {', '.join(top_syms) or '–'}"
     send_message(msg)
 
