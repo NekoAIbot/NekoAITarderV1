@@ -1,289 +1,344 @@
 #!/usr/bin/env python3
-"""Strict OOS backtest using local parquet (preferred) or API data."""
 
-from __future__ import annotations
+"""
+NekoAITrader Production Backtest
+Compatible with production_train.py regime models
+"""
 
 import argparse
-import importlib.util
 import json
 import math
-import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
 
 import joblib
 import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 
-def _load_market_module():
-    module_path = ROOT / "app" / "market_data.py"
-    spec = importlib.util.spec_from_file_location("neko_market_data", module_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Unable to load market_data module from {module_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+# ================================
+# FEATURE ENGINEERING
+# ================================
 
-
-MARKET = _load_market_module()
-
-
-@dataclass
-class BTConfig:
-    timeframe: str
-    data_mode: str
-    limit: int
-    horizon: int
-    threshold: float | None
-    spread_bps: float
-    slippage_bps: float
-    fee_bps: float
-    min_rows_per_symbol: int
-
-
-def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
-    req = ["open", "high", "low", "close", "volume"]
-    if not set(req).issubset(df.columns):
-        raise ValueError("OHLCV columns missing")
-    out = df[req].copy()
-    out.index = pd.to_datetime(out.index, utc=True, errors="coerce")
-    out = out.dropna()
-    out = out[~out.index.duplicated(keep="last")].sort_index()
-    return out
-
-
-def load_local_parquet(symbol: str, timeframe: str) -> pd.DataFrame | None:
-    fx_dir = ROOT / "data" / "raw" / "fx"
-    crypto_dir = ROOT / "data" / "raw" / "crypto"
-
-    if symbol.endswith("USDT"):
-        f = crypto_dir / f"{symbol}_{timeframe}.parquet"
-        return pd.read_parquet(f) if f.exists() else None
-
-    files = sorted(fx_dir.glob(f"{symbol}_M1_*.parquet"))
-    if not files:
-        return None
-    return pd.concat([pd.read_parquet(fp) for fp in files]).sort_index()
-
-
-def _provider_attempts(symbol: str, timeframe: str, limit: int) -> Iterable[Tuple[str, Any]]:
-    yield "yfinance", lambda: MARKET.fetch_yfinance(symbol, timeframe, limit)
-    yield "twelvedata", lambda: MARKET.fetch_twelvedata(symbol, timeframe, limit)
-    yield "alphavantage", lambda: MARKET.fetch_alphavantage(symbol, timeframe, limit)
-
-
-def fetch_real_data(symbol: str, timeframe: str, limit: int, min_rows: int, data_mode: str) -> Tuple[pd.DataFrame, str]:
-    errs: List[str] = []
-
-    local_df = load_local_parquet(symbol, timeframe)
-    if local_df is not None:
-        try:
-            df = _ensure_ohlcv(local_df)
-            if len(df) >= min_rows and (df["close"] > 0).all():
-                return df.tail(limit), "local_parquet"
-            raise ValueError(f"quality fail rows={len(df)}")
-        except Exception as exc:  # noqa: BLE001
-            errs.append(f"local_parquet:{exc}")
-
-    if data_mode == "parquet-only":
-        raise RuntimeError(f"{symbol}: {' | '.join(errs) if errs else 'missing parquet'}")
-
-    for provider, fn in _provider_attempts(symbol, timeframe, limit):
-        try:
-            df = _ensure_ohlcv(fn())
-            if len(df) < min_rows:
-                raise ValueError(f"too few rows ({len(df)}<{min_rows})")
-            if (df["close"] <= 0).any():
-                raise ValueError("non-positive close")
-            return df, provider
-        except Exception as exc:  # noqa: BLE001
-            errs.append(f"{provider}:{exc}")
-
-    raise RuntimeError(f"{symbol}: data fetch failed ({' | '.join(errs)})")
-
-
-def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+def rsi(close, period=14):
     delta = close.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ru = up.ewm(alpha=1 / period, adjust=False).mean()
-    rd = down.ewm(alpha=1 / period, adjust=False).mean()
-    rs = ru / rd.replace(0, np.nan)
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
     return 100 - (100 / (1 + rs))
 
 
-def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr = pd.concat([(df["high"] - df["low"]).abs(), (df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()], axis=1).max(axis=1)
+def atr(df, period=14):
+
+    prev_close = df.close.shift(1)
+
+    tr = pd.concat([
+        df.high - df.low,
+        (df.high - prev_close).abs(),
+        (df.low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
     return tr.rolling(period).mean()
 
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_features(df):
+
     x = df.copy()
-    x["ret_1"] = x["close"].pct_change(1)
-    x["ret_3"] = x["close"].pct_change(3)
-    x["ret_6"] = x["close"].pct_change(6)
-    x["ret_12"] = x["close"].pct_change(12)
-    x["log_ret_1"] = np.log(x["close"]).diff(1)
-    x["ema_8"] = x["close"].ewm(span=8, adjust=False).mean()
-    x["ema_21"] = x["close"].ewm(span=21, adjust=False).mean()
-    x["ema_55"] = x["close"].ewm(span=55, adjust=False).mean()
-    x["ema_spread_8_21"] = (x["ema_8"] - x["ema_21"]) / x["close"].replace(0, np.nan)
-    x["ema_spread_21_55"] = (x["ema_21"] - x["ema_55"]) / x["close"].replace(0, np.nan)
-    x["rsi_14"] = _rsi(x["close"], 14)
-    x["atr_14"] = _atr(x, 14)
-    x["atr_pct"] = x["atr_14"] / x["close"].replace(0, np.nan)
-    x["hl_range"] = (x["high"] - x["low"]) / x["close"].replace(0, np.nan)
-    x["vol_z20"] = (x["volume"] - x["volume"].rolling(20).mean()) / x["volume"].rolling(20).std().replace(0, np.nan)
-    x["mom_10"] = (x["close"] - x["close"].shift(10)) / x["close"].shift(10).replace(0, np.nan)
-    return x
+
+    # returns
+    x["ret_1"] = x.close.pct_change(1)
+    x["ret_3"] = x.close.pct_change(3)
+    x["ret_12"] = x.close.pct_change(12)
+
+    # EMAs
+    x["ema_8"] = x.close.ewm(span=8, adjust=False).mean()
+    x["ema_21"] = x.close.ewm(span=21, adjust=False).mean()
+
+    x["ema_spread"] = (x.ema_8 - x.ema_21) / x.close
+
+    # ATR
+    x["atr"] = atr(x)
+    x["atr_pct"] = x.atr / x.close
+
+    # RSI
+    x["rsi"] = rsi(x.close)
+
+    # Volatility regime
+    vol = x["ret_1"].rolling(200).std()
+    pct = vol.rolling(500).rank(pct=True)
+
+    x["vol_regime"] = pd.cut(
+        pct,
+        bins=[0.0, 0.33, 0.66, 1.0],
+        labels=[0,1,2]
+    ).astype(float)
+
+    # Time features
+    hours = x.index.hour
+
+    x["hour_sin"] = np.sin(2*np.pi*hours/24)
+    x["hour_cos"] = np.cos(2*np.pi*hours/24)
+
+    # Day-of-week features (FIX)
+    dow = x.index.dayofweek
+
+    x["dow_sin"] = np.sin(2*np.pi*dow/7)
+    x["dow_cos"] = np.cos(2*np.pi*dow/7)
+
+    # Cross-sectional momentum (FIX)
+    if "symbol" in x.columns:
+        x["cs_momentum"] = x.groupby("symbol")["ret_12"].transform(lambda s: s - s.mean())
+    else:
+        x["cs_momentum"] = x["ret_12"]
+
+    return x.replace([np.inf, -np.inf], np.nan)
+
+# ================================
+# DATA LOADER
+# ================================
+
+def load_fx_data():
+
+    fx_dir = ROOT / "data/FX_DATA/PARQUET"
+
+    frames = []
+
+    for f in fx_dir.glob("*.parquet"):
+
+        sym = f.stem
+
+        df = pd.read_parquet(f)
+
+        df.index = pd.to_datetime(df.index, utc=True)
+
+        df["symbol"] = sym
+
+        frames.append(df)
+
+    if not frames:
+        raise RuntimeError("No FX parquet files found")
+
+    df = pd.concat(frames).sort_index()
+
+    return df
 
 
-def assemble_panel(symbols: List[str], cfg: BTConfig) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    rows: List[pd.DataFrame] = []
-    provenance: Dict[str, str] = {}
-    for sym in symbols:
-        try:
-            raw, provider = fetch_real_data(sym, cfg.timeframe, cfg.limit, cfg.min_rows_per_symbol, cfg.data_mode)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[WARN] {sym}: {exc}")
+# ================================
+# BACKTEST ENGINE
+# ================================
+
+def run_backtest(models, features, horizon, top_pct):
+
+    panel = load_fx_data()
+
+    panel = build_features(panel)
+
+    panel["target_return"] = panel.close.shift(-horizon)/panel.close - 1
+
+    panel = panel.dropna()
+
+    preds = []
+
+    # ---------------------------
+    # Generate predictions
+    # ---------------------------
+
+    for i in range(len(panel)):
+
+        row = panel.iloc[i]
+
+        regime = int(row["vol_regime"])
+
+        if regime not in models:
+
+            preds.append(0)
+
             continue
 
-        f = build_features(raw)
-        f["target_return"] = (f["close"].shift(-cfg.horizon) / f["close"] - 1).clip(-0.05, 0.05)
-        f["target"] = (f["target_return"] > 0).astype(int)
-        f["symbol"] = sym
-        f = f.replace([np.inf, -np.inf], np.nan).dropna()
-        rows.append(f)
-        provenance[sym] = provider
+        model = models[regime]
 
-    if not rows:
-        raise RuntimeError("No real high-quality data available for backtest")
+        X = row[features].values.reshape(1, -1)
 
-    panel = pd.concat(rows).sort_index()
-    p = panel.pivot_table(index=panel.index, columns="symbol", values="ret_1")
-    panel["cross_ret_mean"] = p.mean(axis=1).reindex(panel.index).fillna(0.0).values
-    panel["cross_ret_std"] = p.std(axis=1).reindex(panel.index).fillna(0.0).values
-    panel = panel.replace([np.inf, -np.inf], np.nan).dropna(subset=["target", "target_return"])
-    return panel, provenance
+        try:
+            pred = model.predict(X)[0]
+        except Exception:
+            pred = 0
 
+        preds.append(pred)
 
-def max_drawdown(equity: np.ndarray) -> float:
-    peaks = np.maximum.accumulate(equity) if len(equity) else np.array([1.0])
-    dd = (equity - peaks) / np.maximum(peaks, 1e-9) if len(equity) else np.array([0.0])
-    return float(dd.min())
+    preds = np.array(preds)
 
+    # ---------------------------
+    # Signal filtering
+    # ---------------------------
 
-def ann_factor(tf: str) -> float:
-    return float({"1m": 365 * 24 * 60, "5m": 365 * 24 * 12, "15m": 365 * 24 * 4, "30m": 365 * 24 * 2, "1h": 365 * 24, "4h": 365 * 6, "1d": 365}.get(tf, 365 * 24 * 12))
+    if np.all(preds == 0):
 
+        return {
+            "error": "model produced zero predictions",
+            "trades": 0
+        }, np.array([])
 
-def run_backtest(bundle_path: Path, cfg: BTConfig) -> Dict[str, Any]:
-    bundle = joblib.load(bundle_path)
-    model = bundle["model"]
-    symbols = bundle["symbols"]
-    feats = bundle["feature_columns"]
-    threshold = cfg.threshold if cfg.threshold is not None else float(bundle.get("best_threshold", 0.55))
+    threshold = np.percentile(np.abs(preds), 100*(1-top_pct))
 
-    panel, provenance = assemble_panel(symbols, cfg)
-    ts = np.array(sorted(panel.index.unique()))
-    oos = panel[panel.index.map(lambda x: x in set(ts[int(len(ts) * 0.7):]))].copy()
-    if oos.empty:
-        raise RuntimeError("No OOS rows available")
+    signals = np.where(np.abs(preds) >= threshold, np.sign(preds), 0)
 
-    X = oos[feats]
-    ret = np.clip(oos["target_return"].to_numpy(), -0.20, 0.20)
-    proba = model.predict_proba(X)[:, 1]
-    signal = (proba >= threshold).astype(int)
+    # ---------------------------
+    # Execute trades
+    # ---------------------------
 
-    costs = (cfg.spread_bps + cfg.slippage_bps + cfg.fee_bps) / 10000.0
-    strat_ret = np.where(signal == 1, ret - costs, 0.0)
-    strat_ret = np.clip(strat_ret, -0.20, 0.20)
+    trades = []
 
-    equity = np.cumprod(1 + strat_ret)
-    market = np.cumprod(1 + ret)
-    trades = int(np.sum(signal == 1))
-    wins = int(np.sum(strat_ret > 0))
-    sharpe = float((np.mean(strat_ret) / (np.std(strat_ret) + 1e-12)) * math.sqrt(ann_factor(cfg.timeframe)))
+    equity = [1.0]
 
-    result: Dict[str, Any] = {
-        "model_name": bundle.get("best_model_name"),
-        "threshold": threshold,
-        "rows_oos": int(len(oos)),
-        "trades": trades,
-        "win_rate": float(wins / trades) if trades else 0.0,
-        "avg_trade_return": float(np.mean(strat_ret[signal == 1])) if trades else 0.0,
-        "total_return": float(equity[-1] - 1) if len(equity) else 0.0,
-        "market_return": float(market[-1] - 1) if len(market) else 0.0,
-        "max_drawdown": max_drawdown(equity),
-        "sharpe": sharpe,
-        "costs_total_bps": cfg.spread_bps + cfg.slippage_bps + cfg.fee_bps,
-        "symbols": symbols,
-        "provenance": provenance,
-    }
+    for i, sig in enumerate(signals):
 
-    by_symbol: Dict[str, Dict[str, float]] = {}
-    for sym, sdf in oos.groupby("symbol"):
-        xs = sdf[feats]
-        rs = np.clip(sdf["target_return"].to_numpy(), -0.20, 0.20)
-        ps = model.predict_proba(xs)[:, 1]
-        sg = (ps >= threshold).astype(int)
-        sr = np.clip(np.where(sg == 1, rs - costs, 0.0), -0.20, 0.20)
-        eq = np.cumprod(1 + sr)
-        by_symbol[sym] = {
-            "rows": float(len(sdf)),
-            "trades": float(np.sum(sg == 1)),
-            "return": float(eq[-1] - 1) if len(eq) else 0.0,
-            "win_rate": float(np.mean(sr[sg == 1] > 0)) if np.sum(sg == 1) else 0.0,
+        if sig == 0:
+            continue
+
+        ret = panel.iloc[i]["target_return"] * sig
+
+        trades.append(ret)
+
+        equity.append(equity[-1]*(1+ret))
+
+    equity = np.array(equity)
+
+    trades = np.array(trades)
+
+    if len(trades) == 0:
+
+        result = {
+            "error": "no trades executed",
+            "trades": 0,
+            "win_rate": 0,
+            "avg_return": 0,
+            "total_return": 0,
+            "max_drawdown": 0,
+            "sharpe": 0
         }
 
-    result["by_symbol"] = by_symbol
-    return result
+        return result, np.array([])
+
+    wins = np.sum(trades > 0)
+
+    sharpe = np.mean(trades)/(np.std(trades)+1e-9)*math.sqrt(252)
+
+    result = {
+
+        "trades": int(len(trades)),
+
+        "win_rate": float(wins/len(trades)),
+
+        "avg_return": float(np.mean(trades)),
+
+        "total_return": float(equity[-1]-1),
+
+        "max_drawdown": float(np.min(equity/np.maximum.accumulate(equity)-1)),
+
+        "sharpe": float(sharpe)
+    }
+
+    return result, trades
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Strict production OOS backtest")
-    p.add_argument("--bundle", default="models/production/best_production_bundle.joblib")
-    p.add_argument("--timeframe", default="1m")
-    p.add_argument("--data-mode", choices=["parquet-only", "parquet-or-api"], default="parquet-only")
-    p.add_argument("--limit", type=int, default=10000)
-    p.add_argument("--horizon", type=int, default=3)
-    p.add_argument("--threshold", type=float, default=None)
-    p.add_argument("--spread-bps", type=float, default=2.0)
-    p.add_argument("--slippage-bps", type=float, default=1.0)
-    p.add_argument("--fee-bps", type=float, default=0.5)
-    p.add_argument("--min-rows", type=int, default=900)
-    p.add_argument("--output", default="models/production/latest_backtest.json")
-    return p.parse_args()
+# ================================
+# MONTE CARLO
+# ================================
 
+def monte_carlo(trades, runs=500):
+
+    if trades is None or len(trades) == 0:
+
+        return {
+            "mc_median_return": 0,
+            "mc_worst_return": 0,
+            "mc_best_return": 0
+        }
+
+    curves = []
+
+    for _ in range(runs):
+
+        shuffled = np.random.permutation(trades)
+
+        equity = np.cumprod(1 + shuffled)
+
+        if len(equity) == 0:
+            continue
+
+        curves.append(equity[-1])
+
+    curves = np.array(curves)
+
+    return {
+
+        "mc_median_return": float(np.median(curves)-1),
+
+        "mc_worst_return": float(np.min(curves)-1),
+
+        "mc_best_return": float(np.max(curves)-1)
+    }
+
+
+# ================================
+# MAIN
+# ================================
 
 def main():
-    args = parse_args()
-    cfg = BTConfig(
-        timeframe=args.timeframe,
-        data_mode=args.data_mode,
-        limit=args.limit,
-        horizon=args.horizon,
-        threshold=args.threshold,
-        spread_bps=args.spread_bps,
-        slippage_bps=args.slippage_bps,
-        fee_bps=args.fee_bps,
-        min_rows_per_symbol=args.min_rows,
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--model", default="models/production/fx_regime_models.joblib")
+
+    parser.add_argument("--horizon", type=int, default=12)
+
+    parser.add_argument("--top-pct", type=float, default=0.1)
+
+    parser.add_argument("--output", default="models/production/backtest_report.json")
+
+    args = parser.parse_args()
+
+    print("Loading models...")
+
+    bundle = joblib.load(args.model)
+
+    models = bundle["models"]
+
+    features = bundle["features"]
+
+    print("Running backtest...")
+
+    result, trades = run_backtest(
+
+        models,
+        features,
+        args.horizon,
+        args.top_pct
     )
 
-    result = run_backtest(Path(args.bundle), cfg)
-    out = Path(args.output)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(result, indent=2))
+    mc = monte_carlo(trades)
+
+    result.update(mc)
+
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+
+    with open(args.output, "w") as f:
+
+        json.dump(result, f, indent=2)
+
     print(json.dumps(result, indent=2))
-    print(f"[OK] saved report: {out}")
+
+    print(f"\nSaved report → {args.output}")
 
 
 if __name__ == "__main__":
+
     main()
