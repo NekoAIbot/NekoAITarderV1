@@ -12,6 +12,7 @@ from app.mt5_handler import initialize_mt5, shutdown_mt5, open_trade, close_trad
 from app.news import get_news_sentiment
 from app.telegram_bot import send_message, send_message_channel
 from app.state import increment_trade_count
+from app.trade_logger import log_trade_event
 from app.risk_manager import RiskManager
 from app.id_manager import IDManager
 
@@ -79,12 +80,30 @@ def trading_job():
             pc = pm["model"].predict(latest[features])[0]
             sig = "BUY" if pc > 0 else "SELL"
             conf = abs(pc)
+            model_name = f"fx_regime_models (regime={regime})"
+            indicator_used = "Rolling volatility regime + trained regime-specific model"
+            indicator_reason = (
+                "Regime chosen from rolling volatility percentile (200-bar std ranked over 500 bars), "
+                "then the matching model predicts direction for current market condition."
+            )
+            strategy_explanation = (
+                "If model output > 0, bias is BUY; otherwise SELL. Confidence is the absolute model output."
+            )
         else:
             model = BasicModel()
             out = model.predict(df, ns)
             sig = out.get("signal", "HOLD").upper()
             conf = out.get("confidence", 0.0)
             pc = out.get("predicted_change", 0.0)
+            model_name = "MomentumModel (fallback)"
+            indicator_used = "MA, RSI, ATR, ADX, Bollinger width, MACD, OBV, sentiment"
+            indicator_reason = (
+                "Fallback model combines trend, momentum, volatility, volume, and sentiment features "
+                "to infer near-term direction."
+            )
+            strategy_explanation = (
+                "Model selects BUY/SELL from class probabilities and outputs predicted change and confidence."
+            )
 
         sid = idm.next()
 
@@ -107,6 +126,56 @@ def trading_job():
         tp1_price = entry + TP_AMOUNT * pip if sig == "BUY" else entry - TP_AMOUNT * pip
         tp2_price = entry + 2 * TP_AMOUNT * pip if sig == "BUY" else entry - 2 * TP_AMOUNT * pip
         tp3_price = entry + 3 * TP_AMOUNT * pip if sig == "BUY" else entry - 3 * TP_AMOUNT * pip
+        sl_calculation = (
+            f"SL = entry {'-' if sig == 'BUY' else '+'} (SL_AMOUNT={SL_AMOUNT} * pip={pip})"
+        )
+        tp_calculation = (
+            f"TP1/2/3 = entry {'+' if sig == 'BUY' else '-'} (TP_AMOUNT={TP_AMOUNT} * pip={pip}) * [1,2,3]"
+        )
+
+        log_trade_event(
+            symbol=sym,
+            signal=sig,
+            status="signal_generated",
+            entry_price=entry,
+            model_name=model_name,
+            indicator_used=indicator_used,
+            indicator_reason=indicator_reason,
+            strategy_explanation=strategy_explanation,
+            sl_price=sl_price,
+            tp1_price=tp1_price,
+            tp2_price=tp2_price,
+            tp3_price=tp3_price,
+            sl_calculation=sl_calculation,
+            tp_calculation=tp_calculation,
+            news_sentiment=ns,
+            predicted_change_pct=pc * 100,
+            confidence_pct=conf * 100,
+            notes="Signal generated before order placement.",
+        )
+
+        if sig == "HOLD":
+            log_trade_event(
+                symbol=sym,
+                signal=sig,
+                status="failed",
+                entry_price=entry,
+                model_name=model_name,
+                indicator_used=indicator_used,
+                indicator_reason=indicator_reason,
+                strategy_explanation=strategy_explanation,
+                sl_price=sl_price,
+                tp1_price=tp1_price,
+                tp2_price=tp2_price,
+                tp3_price=tp3_price,
+                sl_calculation=sl_calculation,
+                tp_calculation=tp_calculation,
+                news_sentiment=ns,
+                predicted_change_pct=pc * 100,
+                confidence_pct=conf * 100,
+                failure_reason="Model returned HOLD signal; no order submitted.",
+            )
+            continue
 
         box = (
             f"┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
@@ -135,14 +204,87 @@ def trading_job():
         volume = rm.get_lot()
         res    = open_trade(mt5, sym, sig, volume)
         if not res or (hasattr(res, "retcode") and res.retcode != 0):
+            failure_reason = "open_trade returned no result. Check MT5 logs for exact broker failure."
+            if hasattr(res, "retcode"):
+                failure_reason = f"retcode={res.retcode} comment={getattr(res, 'comment', '')}".strip()
+            log_trade_event(
+                symbol=sym,
+                signal=sig,
+                status="failed",
+                volume=volume,
+                entry_price=entry,
+                model_name=model_name,
+                indicator_used=indicator_used,
+                indicator_reason=indicator_reason,
+                strategy_explanation=strategy_explanation,
+                sl_price=sl_price,
+                tp1_price=tp1_price,
+                tp2_price=tp2_price,
+                tp3_price=tp3_price,
+                sl_calculation=sl_calculation,
+                tp_calculation=tp_calculation,
+                news_sentiment=ns,
+                predicted_change_pct=pc * 100,
+                confidence_pct=conf * 100,
+                failure_reason=failure_reason,
+            )
             continue
         ticket = getattr(res, "order", None)
+
+        log_trade_event(
+            symbol=sym,
+            signal=sig,
+            status="executed",
+            volume=volume,
+            entry_price=entry,
+            model_name=model_name,
+            indicator_used=indicator_used,
+            indicator_reason=indicator_reason,
+            strategy_explanation=strategy_explanation,
+            sl_price=sl_price,
+            tp1_price=tp1_price,
+            tp2_price=tp2_price,
+            tp3_price=tp3_price,
+            sl_calculation=sl_calculation,
+            tp_calculation=tp_calculation,
+            news_sentiment=ns,
+            predicted_change_pct=pc * 100,
+            confidence_pct=conf * 100,
+            notes=f"Order accepted. ticket={ticket}",
+        )
 
         time.sleep(MOCK_TRADE_HOLD_SECONDS)
         close_trade(mt5, ticket, sym)
 
         profit = random.choice([TP_AMOUNT * pip, -SL_AMOUNT * pip])
         win = profit > 0
+        exit_price = entry + profit if sig == "BUY" else entry - profit
+
+        log_trade_event(
+            symbol=sym,
+            signal=sig,
+            status="closed",
+            volume=volume,
+            entry_price=entry,
+            exit_price=exit_price,
+            profit=profit,
+            win=win,
+            model_name=model_name,
+            indicator_used=indicator_used,
+            indicator_reason=indicator_reason,
+            strategy_explanation=strategy_explanation,
+            sl_price=sl_price,
+            tp1_price=tp1_price,
+            tp2_price=tp2_price,
+            tp3_price=tp3_price,
+            sl_calculation=sl_calculation,
+            tp_calculation=tp_calculation,
+            news_sentiment=ns,
+            predicted_change_pct=pc * 100,
+            confidence_pct=conf * 100,
+            notes=f"Closed ticket={ticket}",
+        )
+
         increment_trade_count(sym, win=win)
         rm.adjust(win)
         print(f"🏁 {sym} {'WIN' if win else 'LOSS'} ({profit:.5f})")
